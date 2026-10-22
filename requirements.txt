@@ -1,0 +1,14 @@
+asgiref==3.12.1
+bcrypt==5.0.0
+cffi==2.1.1
+cryptography==50.0.2
+Django==5.2.18
+gunicorn==23.0.0
+invoke==3.0.3
+packaging==26.3
+paramiko==4.0.0
+pycparser==3.12
+PyNaCl==1.6.2
+python-dotenv==1.2.4
+sqlparse==0.6.0
+whitenoise==6.12.0

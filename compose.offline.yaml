@@ -1,0 +1,6 @@
+# Use com compose.yaml depois de baixar os wheels no host.
+services:
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile.offline

@@ -1,0 +1,19 @@
+{% load static %}<!doctype html>
+<html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="theme-color" content="#132e28"><title>{{ title|default:"Acesso" }} · Rede Neutra</title><link rel="stylesheet" href="{% static 'app.css' %}"><script src="{% static 'app.js' %}" defer></script></head>
+<body>{% if user.is_authenticated %}
+<aside class="sidebar"><a class="brand" href="{% url 'dashboard' %}"><span class="brand-mark">n<span>•</span></span><span>rede<span class="brand-light">neutra</span><small>GESTÃO DE ACESSO</small></span></a>
+<span class="nav-caption">OPERAÇÃO</span><nav aria-label="Navegação principal">
+<a class="{% if page == 'dashboard' %}selected{% endif %}" href="{% url 'dashboard' %}"><span class="nav-icon">▦</span> Visão geral</a>
+<a class="{% if page == 'onus' %}selected{% endif %}" href="{% url 'onu_list' %}"><span class="nav-icon">⇄</span> ONTs e ONUs</a>
+<a class="{% if page == 'reports' %}selected{% endif %}" href="{% url 'reports' %}"><span class="nav-icon">▥</span> Relatórios</a>
+<span class="nav-caption">INFRAESTRUTURA</span>
+<a class="{% if page == 'provedores' %}selected{% endif %}" href="{% url 'catalog' 'provedores' %}"><span class="nav-icon">◈</span> Provedores</a>
+<a class="{% if page == 'vlans' %}selected{% endif %}" href="{% url 'catalog' 'vlans' %}"><span class="nav-icon">≋</span> VLANs</a>
+<a class="{% if page == 'ctos' %}selected{% endif %}" href="{% url 'catalog' 'ctos' %}"><span class="nav-icon">⊞</span> CTOs</a>
+<a class="{% if page == 'olts' %}selected{% endif %}" href="{% url 'catalog' 'olts' %}"><span class="nav-icon">▤</span> OLTs</a>
+</nav><div class="sidebar-bottom"><span class="connection-dot"></span> Controle da sua rede<small>Infraestrutura compartilhada.<br>Operação conectada.</small></div></aside>
+<div class="workspace"><header class="topbar"><span>Workspace <span class="muted">/</span> <strong>Rede neutra</strong></span><div class="account"><span class="avatar">{{ user.username|first|upper }}</span><span>{{ user.username }}<small>{% if user.is_staff %}Administrador / operador{% else %}Consulta{% endif %}</small></span><form method="post" action="{% url 'logout' %}">{% csrf_token %}<button class="text-button" type="submit">Sair</button></form></div></header>
+<main><div class="page-heading"><div><span class="eyebrow">PAINEL DE OPERAÇÃO</span><h1>{{ title }}</h1>{% block subtitle %}{% endblock %}</div>{% block actions %}{% endblock %}</div>
+{% for message in messages %}<div role="status" class="notice {{ message.tags }}">{{ message }}</div>{% endfor %}
+{% block content %}{% endblock %}</main><footer>Rede Neutra <span>Gestão de provisionamento GPON</span></footer></div>
+{% else %}{% block auth %}{% endblock %}{% endif %}</body></html>
