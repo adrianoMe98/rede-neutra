@@ -12,8 +12,9 @@ from django.shortcuts import get_object_or_404, redirect, render
 from django.views.decorators.http import require_POST
 
 from .adapters import AdapterError, get_adapter
-from .forms import CTOForm, OLTForm, ONUForm, ProviderForm, VlanForm
-from .models import CTO, OLT, ONU, Operation, Provider, Vlan
+from .discovery import load_discovery, scan_olt, validate_selection
+from .forms import CTOForm, DiscoveryForm, OLTForm, ONUForm, ProviderForm, ProvisioningProfileForm, VlanForm
+from .models import CTO, OLT, ONU, DiscoveryScan, Operation, Provider, ProvisioningProfile, Vlan
 from .services import provision, refresh_optics
 
 
@@ -52,6 +53,7 @@ CATALOGS = {
     "vlans": (Vlan, VlanForm, "VLANs", "VLAN"),
     "ctos": (CTO, CTOForm, "CTOs", "CTO"),
     "olts": (OLT, OLTForm, "OLTs", "OLT"),
+    "perfis": (ProvisioningProfile, ProvisioningProfileForm, "Perfis de provisionamento", "perfil"),
 }
 
 
@@ -64,13 +66,16 @@ def catalog(request, kind):
     items = model.objects.all()
     if kind == "vlans":
         items = items.select_related("provider").annotate(onu_count=Count("onus"))
+    elif kind == "perfis":
+        items = items.select_related("provider", "vlan", "olt").annotate(onu_count=Count("onus"))
     else:
         items = items.annotate(onu_count=Count("onus"))
     items = items.order_by("number" if kind == "vlans" else "name")
     q = request.GET.get("q", "").strip()
     if q:
         items = items.filter(**{"number" if kind == "vlans" else "name__icontains": q}) if kind != "vlans" or q.isdigit() else items.none()
-    return render(request, "network/catalog.html", {"items": Paginator(items, 30).get_page(request.GET.get("page")),
+    template = "network/profiles.html" if kind == "perfis" else "network/catalog.html"
+    return render(request, template, {"items": Paginator(items, 30).get_page(request.GET.get("page")),
                                                     "kind": kind, "page": kind, "title": title, "singular": singular, "q": q,
                                                     "query_string": request.GET.urlencode()})
 
@@ -91,7 +96,8 @@ def catalog_edit(request, kind, pk=None):
         except IntegrityError:
             form.add_error(None, "Este cadastro já existe ou conflita com outro registro.")
     return render(request, "network/form.html", {"form": form, "title": f"{'Editar' if pk else 'Cadastrar'} {singular}",
-                                                 "page": kind, "kind": kind, "back_url": f"/cadastros/{kind}/"})
+                                                 "page": kind, "kind": kind, "back_url": f"/cadastros/{kind}/",
+                                                 "vlans_data": list(Vlan.objects.values("id", "provider_id"))})
 
 
 def filtered_onus(request):
@@ -124,34 +130,78 @@ def onu_edit(request, pk=None):
     if onu and onu.status != ONU.Status.DRAFT:
         messages.error(request, "Somente cadastros ainda não provisionados podem ser editados.")
         return redirect("onu_detail", pk=pk)
-    form = ONUForm(request.POST or None, instance=onu)
+    token = request.POST.get("discovery_token", "") if request.method == "POST" else request.GET.get("discovery", "")
+    discovered = None
+    initial = {}
+    if token and not pk:
+        try:
+            discovered = load_discovery(token, request.user)
+        except AdapterError as exc:
+            messages.error(request, str(exc))
+            return redirect("onu_discovery")
+        initial = {key: discovered[key] for key in ("serial", "olt", "frame", "slot", "pon")}
+        initial["discovery_token"] = token
+        occupied_ids = set(ONU.objects.filter(olt_id=discovered["olt"], frame=discovered["frame"],
+                                             slot=discovered["slot"], pon=discovered["pon"]).values_list("ont_id", flat=True))
+        initial["ont_id"] = next((candidate for candidate in range(256) if candidate not in occupied_ids), None)
+        # Apenas sugestão do inventário local; o operador ainda confere a OLT.
+        highest = ONU.objects.filter(olt_id=discovered["olt"]).order_by("-service_port").values_list("service_port", flat=True).first()
+        initial["service_port"] = (highest + 1) if highest is not None and highest < 65535 else None
+    form = ONUForm(request.POST if request.method == "POST" else None, instance=onu, initial=initial, discovery=discovered)
     if request.method == "POST" and form.is_valid():
         try:
             if pk:
                 values = {key: form.cleaned_data[key] for key in form.Meta.fields}
+                values["profile_snapshot"] = form.instance.profile_snapshot
                 if not ONU.objects.filter(pk=pk, status=ONU.Status.DRAFT).update(**values):
                     raise AdapterError("O estado da ONU mudou durante a edição. Recarregue o cadastro.")
                 saved = ONU.objects.get(pk=pk)
             else:
+                if discovered:
+                    form.instance.discovered_at = discovered["scanned_at"]
                 saved = form.save()
             messages.success(request, "ONU cadastrada. Confira o plano antes de provisionar.")
             return redirect("onu_detail", pk=saved.pk)
         except (IntegrityError, AdapterError):
             form.add_error(None, "O cadastro mudou ou a porta / ONT ID / service-port já está em uso. Confira os dados.")
     return render(request, "network/form.html", {"form": form, "title": "Editar ONU" if pk else "Cadastrar ONU",
-        "page": "onus", "kind": "onu", "back_url": "/onus/", "vlans_data": list(Vlan.objects.values("id", "provider_id"))})
+        "page": "onus", "kind": "onu", "back_url": "/onus/", "discovered": discovered,
+        "vlans_data": list(Vlan.objects.values("id", "provider_id")),
+        "profiles_data": list(ProvisioningProfile.objects.filter(active=True).values("id", "provider_id", "vlan_id", "olt_id", "line_profile", "service_profile", "gem_port", "user_vlan"))})
+
+
+@operator
+def onu_discovery(request):
+    form = DiscoveryForm(request.POST if request.method == "POST" else None)
+    scan, rows = None, []
+    if request.method == "POST" and form.is_valid():
+        try:
+            scan, rows = scan_olt(form.cleaned_data["olt"], request.user)
+        except AdapterError as exc:
+            form.add_error(None, str(exc))
+    return render(request, "network/discovery.html", {"form": form, "scan": scan, "rows": rows,
+        "history": DiscoveryScan.objects.filter(actor=request.user).select_related("olt")[:5],
+        "title": "Buscar ONTs não provisionadas", "page": "onus"})
 
 
 @login_required
 def onu_detail(request, pk):
-    onu = get_object_or_404(ONU.objects.select_related("provider", "vlan", "cto", "olt"), pk=pk)
+    onu = get_object_or_404(ONU.objects.select_related("provider", "vlan", "cto", "olt", "profile"), pk=pk)
+    token = request.GET.get("discovery", "")
+    if token:
+        try:
+            validate_selection(onu, load_discovery(token, request.user))
+        except AdapterError as exc:
+            messages.error(request, str(exc))
+            return redirect("onu_discovery")
     try:
         plan = get_adapter(onu.olt).plan(onu)
         plan_error = ""
     except AdapterError as exc:
         plan, plan_error = [], str(exc)
     return render(request, "network/onu_detail.html", {"onu": onu, "plan": plan, "plan_error": plan_error,
-        "operations": onu.operations.select_related("actor")[:30], "page": "onus", "title": onu.description})
+        "operations": onu.operations.select_related("actor")[:30], "page": "onus", "title": onu.description,
+        "discovery_token": token})
 
 
 @operator
@@ -162,6 +212,11 @@ def onu_action(request, pk, action):
         if action == "provision":
             if request.POST.get("confirmed") != "yes":
                 raise AdapterError("Confirme a revisão dos dados e do plano de provisionamento.")
+            token = request.POST.get("discovery_token", "")
+            if token:
+                selected = load_discovery(token, request.user)
+                validate_selection(onu, selected)
+                onu.discovered_at = selected["scanned_at"]
             messages.success(request, provision(onu, request.user))
         elif action == "optics":
             reading = refresh_optics(onu, request.user)

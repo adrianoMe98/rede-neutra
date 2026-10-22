@@ -8,6 +8,7 @@ urlpatterns = [
     path("cadastros/<str:kind>/novo/", views.catalog_edit, name="catalog_create"),
     path("cadastros/<str:kind>/<int:pk>/", views.catalog_edit, name="catalog_edit"),
     path("onus/", views.onu_list, name="onu_list"),
+    path("onus/descobrir/", views.onu_discovery, name="onu_discovery"),
     path("onus/nova/", views.onu_edit, name="onu_create"),
     path("onus/<int:pk>/", views.onu_detail, name="onu_detail"),
     path("onus/<int:pk>/editar/", views.onu_edit, name="onu_edit"),

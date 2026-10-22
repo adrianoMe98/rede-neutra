@@ -1,0 +1,22 @@
+{% extends 'base.html' %}
+{% block subtitle %}<p>Localize as ONTs detectadas na OLT e inicie o provisionamento.</p>{% endblock %}
+{% block actions %}<div class="actions"><a class="button secondary" href="{% url 'catalog' 'perfis' %}">Perfis de provisionamento</a><a class="button secondary" href="{% url 'onu_list' %}">← Equipamentos</a></div>{% endblock %}
+{% block content %}
+<section class="panel discovery-panel">
+  <div class="panel-heading"><div><h2>Consultar equipamentos disponíveis</h2><p>A busca consulta a descoberta automática da OLT. Nenhuma ONT será provisionada nesta etapa.</p></div></div>
+  <form method="post" class="discovery-form">{% csrf_token %}
+    {% if form.non_field_errors %}<div class="notice error" role="alert">{{ form.non_field_errors }}</div>{% endif %}
+    <div class="discovery-controls"><div class="field"><label for="{{ form.olt.id_for_label }}">{{ form.olt.label }}</label>{{ form.olt }}{% for error in form.olt.errors %}<span class="field-error">{{ error }}</span>{% endfor %}</div><button type="submit" class="button primary">Buscar ONTs não provisionadas</button></div>
+    <p class="hint">Huawei: <code>display ont autofind all</code>. Para integrar um equipamento físico, configure a OLT em SSH. Em simulação, os resultados são demonstrativos.</p>
+  </form>
+</section>
+{% if scan %}
+  {% if scan.simulation %}<div class="notice info"><span class="badge simulation">SIMULAÇÃO</span> ONTs fictícias para testar o fluxo. Nenhum equipamento físico foi consultado.</div>{% endif %}
+  <section class="panel"><div class="panel-heading"><div><h2>{{ rows|length }} {% if rows|length == 1 %}ONT disponível{% else %}ONTs disponíveis{% endif %}</h2><p>{{ scan.olt.name }} · Consulta em {{ scan.created_at|date:'d/m/Y H:i:s' }}. Selecione uma ONT em até 15 minutos.</p></div><span class="badge {% if scan.simulation %}simulation{% else %}active{% endif %}">{% if scan.simulation %}Simulação{% else %}Consulta SSH{% endif %}</span></div>
+  <div class="table-wrap"><table><thead><tr><th>Serial da ONT</th><th>PON</th><th>Fabricante / equipamento</th><th>Cadastro no ERP</th><th>Ação</th></tr></thead><tbody>
+  {% for row in rows %}<tr><td class="mono"><strong>{{ row.item.serial }}</strong></td><td>{{ row.item.pon_address }}</td><td>{{ row.item.vendor|default:'Não informado' }}<small>{{ row.item.equipment|default:'Modelo não informado' }}</small></td><td>{% if row.existing %}<span class="badge {{ row.existing.status }}">{{ row.existing.get_status_display }}</span><small>{{ row.existing.description }}</small>{% if not row.position_matches %}<small>Cadastro em outra OLT/PON: {{ row.existing.olt.name }} · {{ row.existing.pon_address }}</small>{% endif %}{% else %}<span class="badge draft">Ainda não cadastrada</span>{% endif %}</td><td>{% if row.existing %}<a class="button secondary" href="{% url 'onu_detail' row.existing.pk %}{% if row.token %}?discovery={{ row.token|urlencode }}{% endif %}">{% if row.existing.status == 'draft' and row.position_matches %}Continuar provisionamento{% else %}Conferir cadastro{% endif %}</a>{% else %}<a class="button primary" href="{% url 'onu_create' %}?discovery={{ row.token|urlencode }}">Provisionar →</a>{% endif %}</td></tr>
+  {% empty %}<tr><td colspan="5"><div class="empty"><span class="empty-icon">⇄</span><h3>Nenhuma ONT disponível para cadastro</h3><p>Confira se a ONT está conectada à PON e se a descoberta automática está habilitada na OLT. Equipamentos já provisionados no ERP são omitidos.</p></div></td></tr>{% endfor %}
+  </tbody></table></div></section>
+{% endif %}
+{% if history %}<section class="panel"><div class="panel-heading"><div><h2>Suas últimas buscas</h2><p>Histórico de consultas, sem armazenar senhas ou respostas brutas da CLI.</p></div></div><div class="table-wrap"><table><thead><tr><th>Data</th><th>OLT</th><th>Resultado</th><th>Detectadas</th><th>Detalhes</th></tr></thead><tbody>{% for item in history %}<tr><td>{{ item.created_at|date:'d/m/Y H:i:s' }}</td><td>{{ item.olt.name }}{% if item.simulation %}<small>Simulação</small>{% endif %}</td><td><span class="badge {{ item.outcome }}">{{ item.get_outcome_display }}</span></td><td>{{ item.count }}</td><td class="wrap-cell">{{ item.detail|default:'Consulta concluída.' }}</td></tr>{% endfor %}</tbody></table></div></section>{% endif %}
+{% endblock %}

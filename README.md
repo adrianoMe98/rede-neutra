@@ -10,6 +10,8 @@ ERP web para cadastro e provisionamento de ONTs/ONUs em uma rede neutra. Interfa
 - VLAN exclusiva por número nesta rede, vinculada a um provedor. VLANs compartilhadas ou reutilizadas por domínio não fazem parte deste MVP.
 - Reserva exclusiva de porta na CTO, ONT ID por PON e service-port por OLT; validação da capacidade da CTO e do provedor da VLAN.
 - Plano de provisionamento, confirmação pelo operador, execução e histórico com usuário/data/resultado.
+- Busca de ONTs não provisionadas por OLT, usando `display ont autofind all` no adaptador Huawei, com seleção da ONT e preenchimento de serial e PON.
+- Perfis de provisionamento por provedor/OLT com VLAN de serviço, VLAN do cliente, line profile, service profile e GEM port. Os parâmetros são copiados para o cadastro da ONU e preservados após edições do perfil.
 - Consulta pontual de TX/RX **na ONU**, em dBm, com data da leitura. O estado “Provisionada” indica sucesso do cadastro na integração, e não monitoração online/offline.
 - Relatórios com filtros por descrição/serial, provedor, situação, VLAN, CTO e OLT, e exportação CSV compatível com Excel. Leituras simuladas são identificadas na tela e no CSV.
 - Simulação de todo o fluxo sem conexão com equipamentos; adaptadores separados por fabricante.
@@ -75,7 +77,19 @@ Em cada tarefa na nuvem use o checkout existente: o ambiente já é isolado, nã
 | MA5683T | MA5600V800R017C10 | Adaptador SSH experimental |
 | ZTE, FiberHome, outros | A definir | Simulação; adaptador físico ainda não implementado |
 
-O adaptador Huawei gera `ont add` por SN/OMCI e `service-port` com tradução de VLAN, e consulta `display ont optical-info`. O mapeamento atual é uma VLAN de usuário igual à VLAN de serviço e um GEM port por perfil. **VLAN, line profile, service profile e mapeamento GEM devem já existir na OLT.** Cadastrar VLAN no ERP não a cria no equipamento. Configuração WAN, PPPoE, portas Ethernet, TR-069 e perfis de bridge/router não são configurados neste MVP.
+O adaptador Huawei consulta `display ont autofind all`, gera `ont add` por SN/OMCI e `service-port` com tradução de VLAN e consulta `display ont optical-info`. O perfil permite definir a VLAN do cliente; em branco, usa a mesma VLAN de serviço. Cada perfil utiliza um GEM port. **VLAN, line profile, service profile e mapeamento GEM devem já existir na OLT.** Cadastrar VLAN ou perfil no ERP não os cria no equipamento. Configuração WAN, PPPoE, portas Ethernet, TR-069 e perfis de bridge/router não são configurados neste MVP.
+
+### Buscar e provisionar uma ONT
+
+1. Em **Perfis de provisionamento**, cadastre um perfil associado ao provedor, à OLT e à VLAN de serviço. Preencha os IDs de line/service profile, o GEM e, opcionalmente, a VLAN do cliente. Também é possível cadastrar manualmente uma ONU sem perfil, usando os padrões da OLT.
+2. Em **ONTs e ONUs**, clique em **Buscar ONTs não provisionadas**, selecione a OLT e execute a busca. Em SSH, a consulta Huawei usa `enable`, `config` e `display ont autofind all`. Em simulação, aparecem três ONTs fictícias, identificadas como demonstrativas.
+3. Clique em **Provisionar** na ONT desejada. O serial e a PON serão preenchidos a partir da consulta; a seleção é válida por 15 minutos e vinculada ao operador. Se já houver um cadastro pendente do mesmo serial, o sistema permite continuar esse cadastro em vez de duplicá-lo.
+4. Selecione o perfil para preencher provedor, OLT e VLAN, informe cliente e CTO/porta, e reserve ONT ID e service-port livres. As sugestões de IDs consideram **somente o inventário local** e não garantem disponibilidade física na OLT.
+5. Clique em **Salvar e revisar provisionamento**, confira o plano e confirme o envio. Para ONTs vindas da busca, o adaptador Huawei consulta novamente o autofind antes de `ont add`; se o serial não estiver na mesma PON, nenhum comando de alteração será enviado.
+
+Buscas exigem usuário operador e proteção CSRF. O histórico guarda OLT, usuário, data, quantidade e resultado, sem armazenar a resposta bruta da CLI, LOID ou senha das ONTs. O parser suporta registros Huawei com `F/S/P`, `Ont SN`, `Ont VendorID` e `Ont EquipmentID`; formatos desconhecidos geram erro de interpretação em vez de um resultado vazio incorreto. A homologação dos retornos do firmware real continua necessária.
+
+Os perfis funcionam como modelos de parâmetros no ERP. Alterações futuras de nome ou IDs do perfil não modificam o conjunto já copiado para uma ONU cadastrada; para mudar os parâmetros de um cadastro ainda não provisionado, selecione outro perfil. Não é permitido trocar provedor, OLT ou VLAN de um perfil em uso. Desativar um perfil impede sua seleção em novos cadastros.
 
 O firmware é comparado com `display version` antes de enviar comandos. A compatibilidade efetiva da CLI depende do hardware, do patch de firmware, dos perfis e das permissões da conta; os testes automatizados usam respostas simuladas, não OLTs físicas. Não há alegação de homologação real. **Telnet não foi implementado**: os equipamentos informados podem usar SSH.
 
@@ -98,7 +112,7 @@ docker compose exec web python manage.py reconcile_onu HWTC00000001 \
   --reason 'ONT e service-port confirmados na CLI pelo operador responsável'
 ```
 
-Use `--state draft` apenas quando confirmar que **não há** cadastro nem configuração parcial na OLT. Pare/aguarde qualquer operação em andamento antes de reconciliar. O comando não altera o equipamento. Para adicionar fabricantes, implemente `plan`, `provision` e `optics` em `network/adapters.py`, registre o adaptador e crie testes com transcrições reais sanitizadas.
+Use `--state draft` apenas quando confirmar que **não há** cadastro nem configuração parcial na OLT. Pare/aguarde qualquer operação em andamento antes de reconciliar. O comando não altera o equipamento. Para adicionar fabricantes, implemente `discover`, `plan`, `provision` e `optics` em `network/adapters.py`, registre o adaptador e crie testes com transcrições reais sanitizadas.
 
 ## Validação
 
@@ -168,6 +182,6 @@ Sem Docker, pare o servidor, execute os comandos correspondentes com o Python do
 
 Para acesso externo, coloque um proxy com HTTPS à frente da aplicação, ajuste `DJANGO_ALLOWED_HOSTS` e `CSRF_TRUSTED_ORIGINS` para o domínio exato e defina `COOKIE_SECURE=1`. A configuração padrão é local e mantém `DJANGO_DEBUG=0`. A aplicação não assume cabeçalhos de proxy confiáveis; configure essa relação explicitamente na sua infraestrutura.
 
-Crie usuários de consulta sem `is_staff`; operadores possuem `is_staff`; apenas superusuários devem administrar contas. Os operadores desta versão têm acesso à rede inteira. Isolamento de acesso por provedor, faturamento, SNMP, coleta periódica, descoberta automática de ONUs, desprovisionamento e suporte físico a outros fabricantes ficam para próximas etapas.
+Crie usuários de consulta sem `is_staff`; operadores possuem `is_staff`; apenas superusuários devem administrar contas. Os operadores desta versão têm acesso à rede inteira. Isolamento de acesso por provedor, faturamento, SNMP, coleta periódica, descoberta agendada, desprovisionamento e suporte físico a outros fabricantes ficam para próximas etapas.
 
 Faça backup consistente de SQLite (API de backup ou serviço parado), do arquivo de chaves e de `known_hosts`, protegendo esses materiais. Nunca copie um banco em escrita sem garantir consistência. As chaves de configuração e as senhas não fazem parte dos arquivos distribuídos no repositório.

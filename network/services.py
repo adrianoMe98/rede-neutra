@@ -6,13 +6,15 @@ from .models import ONU, Operation
 
 def provision(onu, actor):
     adapter = get_adapter(onu.olt)
+    onu.full_clean()
     adapter.plan(onu)
     if onu.olt.mode == "ssh":
         adapter.preflight(onu.olt)
-    onu.full_clean()
     # Compare-and-swap: o mesmo cadastro não pode ser enviado duas vezes.
     with transaction.atomic():
-        if not ONU.objects.filter(pk=onu.pk, status=ONU.Status.DRAFT).update(status=ONU.Status.RUNNING):
+        if not ONU.objects.filter(pk=onu.pk, status=ONU.Status.DRAFT).update(
+            status=ONU.Status.RUNNING, profile_snapshot=onu.profile_snapshot, discovered_at=onu.discovered_at
+        ):
             raise AdapterError("Esta ONU já foi provisionada, está em andamento ou exige conferência. Não será reenviada.")
         operation = Operation.objects.create(onu=onu, actor=actor, kind="provision", outcome="running",
                                              simulation=onu.olt.mode == "simulation", detail="Envio iniciado.")

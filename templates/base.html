@@ -11,6 +11,7 @@
 <a class="{% if page == 'vlans' %}selected{% endif %}" href="{% url 'catalog' 'vlans' %}"><span class="nav-icon">≋</span> VLANs</a>
 <a class="{% if page == 'ctos' %}selected{% endif %}" href="{% url 'catalog' 'ctos' %}"><span class="nav-icon">⊞</span> CTOs</a>
 <a class="{% if page == 'olts' %}selected{% endif %}" href="{% url 'catalog' 'olts' %}"><span class="nav-icon">▤</span> OLTs</a>
+<a class="{% if page == 'perfis' %}selected{% endif %}" href="{% url 'catalog' 'perfis' %}"><span class="nav-icon">≡</span> Perfis de provisionamento</a>
 </nav><div class="sidebar-bottom"><span class="connection-dot"></span> Controle da sua rede<small>Infraestrutura compartilhada.<br>Operação conectada.</small></div></aside>
 <div class="workspace"><header class="topbar"><span>Workspace <span class="muted">/</span> <strong>Rede neutra</strong></span><div class="account"><span class="avatar">{{ user.username|first|upper }}</span><span>{{ user.username }}<small>{% if user.is_staff %}Administrador / operador{% else %}Consulta{% endif %}</small></span><form method="post" action="{% url 'logout' %}">{% csrf_token %}<button class="text-button" type="submit">Sair</button></form></div></header>
 <main><div class="page-heading"><div><span class="eyebrow">PAINEL DE OPERAÇÃO</span><h1>{{ title }}</h1>{% block subtitle %}{% endblock %}</div>{% block actions %}{% endblock %}</div>

@@ -1,5 +1,3 @@
-import re
-
 from cryptography.fernet import Fernet, InvalidToken
 from django.conf import settings
 from django.core.exceptions import ValidationError
@@ -38,6 +36,8 @@ class Vlan(models.Model):
     def clean(self):
         if self.pk and self.onus.exclude(provider_id=self.provider_id).exists():
             raise ValidationError("Não é possível trocar o provedor de uma VLAN em uso por outro provedor.")
+        if self.pk and self.provisioning_profiles.exclude(provider_id=self.provider_id).exists():
+            raise ValidationError("Esta VLAN está vinculada a perfis de outro provedor.")
 
     def __str__(self):
         return f"{self.number} · {self.provider.name}"
@@ -113,6 +113,10 @@ class ONU(models.Model):
         REVIEW = "review", "Conferir na OLT"
 
     provider = models.ForeignKey(Provider, on_delete=models.PROTECT, verbose_name="provedor", related_name="onus")
+    profile = models.ForeignKey("ProvisioningProfile", null=True, blank=True, on_delete=models.PROTECT,
+                               verbose_name="perfil de provisionamento", related_name="onus")
+    profile_snapshot = models.JSONField(default=dict, blank=True, editable=False)
+    discovered_at = models.DateTimeField(null=True, blank=True, editable=False)
     subscriber = models.CharField("nome do cliente / identificação", max_length=80)
     serial = models.CharField("serial da ONT / ONU", max_length=16, unique=True,
                               validators=[RegexValidator(r"^[A-Z0-9]{8,16}$", "Use de 8 a 16 letras maiúsculas ou números.")])
@@ -148,6 +152,13 @@ class ONU(models.Model):
     def pon_address(self):
         return f"{self.frame}/{self.slot}/{self.pon}"
 
+    @property
+    def provisioning_parameters(self):
+        if self.profile_snapshot:
+            return self.profile_snapshot
+        return {"line_profile": self.olt.line_profile, "service_profile": self.olt.service_profile,
+                "gem_port": self.olt.gem_port, "user_vlan": self.vlan.number}
+
     def clean(self):
         errors = {}
         if self.provider_id and not self.provider.active:
@@ -156,11 +167,68 @@ class ONU(models.Model):
             errors["vlan"] = "A VLAN precisa pertencer ao provedor selecionado."
         if self.cto_id and self.port and self.port > self.cto.total_ports:
             errors["port"] = f"Esta CTO possui apenas {self.cto.total_ports} portas."
+        if self.profile_id:
+            profile = self.profile
+            if not profile.active:
+                errors["profile"] = "O perfil selecionado está inativo."
+            if (self.provider_id, self.vlan_id, self.olt_id) != (profile.provider_id, profile.vlan_id, profile.olt_id):
+                errors["profile"] = "Provedor, VLAN e OLT devem corresponder ao perfil selecionado."
+            if not self.profile_snapshot or self.profile_snapshot.get("profile_id") != profile.pk:
+                self.profile_snapshot = profile.parameters()
+        else:
+            self.profile_snapshot = {}
         if errors:
             raise ValidationError(errors)
 
     def __str__(self):
         return self.description
+
+
+class ProvisioningProfile(models.Model):
+    name = models.CharField("nome do perfil", max_length=100, unique=True)
+    provider = models.ForeignKey(Provider, on_delete=models.PROTECT, verbose_name="provedor", related_name="provisioning_profiles")
+    olt = models.ForeignKey(OLT, on_delete=models.PROTECT, verbose_name="OLT", related_name="provisioning_profiles")
+    vlan = models.ForeignKey(Vlan, on_delete=models.PROTECT, verbose_name="VLAN de serviço", related_name="provisioning_profiles")
+    line_profile = models.PositiveIntegerField("ID do line profile", validators=bounded(1, 4095))
+    service_profile = models.PositiveIntegerField("ID do service profile", validators=bounded(1, 4095))
+    gem_port = models.PositiveIntegerField("GEM port", default=1, validators=bounded(0, 4095))
+    user_vlan = models.PositiveIntegerField("VLAN do cliente", null=True, blank=True, validators=bounded(1, 4094),
+                                           help_text="Em branco, utiliza o mesmo número da VLAN de serviço.")
+    description = models.CharField("observações", max_length=240, blank=True)
+    active = models.BooleanField("ativo", default=True)
+
+    class Meta:
+        ordering = ["name"]
+        verbose_name = "perfil de provisionamento"
+
+    def clean(self):
+        if self.vlan_id and self.provider_id and self.vlan.provider_id != self.provider_id:
+            raise ValidationError({"vlan": "A VLAN de serviço precisa pertencer ao provedor do perfil."})
+        if self.pk and self.onus.exists():
+            original = type(self).objects.get(pk=self.pk)
+            if any(getattr(self, name) != getattr(original, name) for name in ("provider_id", "vlan_id", "olt_id")):
+                raise ValidationError("Um perfil em uso não pode trocar de provedor, VLAN ou OLT. Crie outro perfil.")
+
+    def parameters(self):
+        return {"profile_id": self.pk, "name": self.name, "line_profile": self.line_profile,
+                "service_profile": self.service_profile, "gem_port": self.gem_port,
+                "user_vlan": self.user_vlan if self.user_vlan is not None else self.vlan.number}
+
+    def __str__(self):
+        return self.name
+
+
+class DiscoveryScan(models.Model):
+    olt = models.ForeignKey(OLT, on_delete=models.PROTECT, related_name="discovery_scans")
+    actor = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, on_delete=models.SET_NULL)
+    simulation = models.BooleanField()
+    outcome = models.CharField(max_length=10, choices=[("success", "Concluída"), ("failed", "Falhou")])
+    count = models.PositiveIntegerField(default=0)
+    detail = models.CharField(max_length=240, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-created_at"]
 
 
 class Operation(models.Model):

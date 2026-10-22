@@ -9,6 +9,7 @@ from dataclasses import dataclass
 import paramiko
 from django.conf import settings
 from django.core.exceptions import ValidationError
+from .serials import normalize_serial
 
 
 class AdapterError(Exception):
@@ -25,10 +26,31 @@ class OpticalReading:
     rx: float
 
 
+@dataclass(frozen=True)
+class DiscoveredONT:
+    serial: str
+    frame: int
+    slot: int
+    pon: int
+    vendor: str = ""
+    equipment: str = ""
+
+    @property
+    def pon_address(self):
+        return f"{self.frame}/{self.slot}/{self.pon}"
+
+
 class SimulatedAdapter:
+    def discover(self, olt):
+        prefix = hashlib.sha256(f"olt:{olt.pk}".encode()).hexdigest()[:6].upper()
+        return [DiscoveredONT(f"HWTC{prefix}{index:02X}", 0, 1, index - 1, "HWTC", "ONT de demonstração")
+                for index in (1, 2, 3)]
+
     def plan(self, onu):
         return [f"SIMULAÇÃO: cadastrar {onu.serial} em {onu.pon_address}, ONT {onu.ont_id}",
-                f"SIMULAÇÃO: VLAN {onu.vlan.number}; descrição: {onu.description}"]
+                f"SIMULAÇÃO: VLAN {onu.vlan.number}; descrição: {onu.description}",
+                f"SIMULAÇÃO: line profile {onu.provisioning_parameters['line_profile']}; "
+                f"service profile {onu.provisioning_parameters['service_profile']}; GEM {onu.provisioning_parameters['gem_port']}"]
 
     def provision(self, onu):
         return "Provisionamento simulado concluído. Nenhuma conexão com a OLT foi aberta."
@@ -52,11 +74,82 @@ class HuaweiAdapter:
         desc = re.sub(r"[^A-Za-z0-9 ._-]", "", text)
         if not desc or len(desc) > 64:
             raise AdapterError("A descrição Huawei deve ter no máximo 64 caracteres ASCII após normalização.")
+        parameters = onu.provisioning_parameters
+        checked = {}
+        for name, low, high in [("line_profile", 1, 4095), ("service_profile", 1, 4095), ("gem_port", 0, 4095), ("user_vlan", 1, 4094)]:
+            try:
+                value = parameters[name]
+                if type(value) is not int or not low <= value <= high:
+                    raise ValueError
+                checked[name] = value
+            except (ValueError, KeyError):
+                raise AdapterError("O perfil de provisionamento contém parâmetros inválidos. Revise o cadastro.") from None
         return ["enable", "config", f"interface gpon {onu.frame}/{onu.slot}",
                 f'ont add {onu.pon} {onu.ont_id} sn-auth "{onu.serial}" omci '
-                f'ont-lineprofile-id {onu.olt.line_profile} ont-srvprofile-id {onu.olt.service_profile} desc "{desc}"',
+                f'ont-lineprofile-id {checked["line_profile"]} ont-srvprofile-id {checked["service_profile"]} desc "{desc}"',
                 "quit", f"service-port {onu.service_port} vlan {onu.vlan.number} gpon {onu.pon_address} "
-                f"ont {onu.ont_id} gemport {onu.olt.gem_port} multi-service user-vlan {onu.vlan.number} tag-transform translate"]
+                f"ont {onu.ont_id} gemport {checked['gem_port']} multi-service user-vlan {checked['user_vlan']} tag-transform translate"]
+
+    @staticmethod
+    def empty_discovery(output):
+        return bool(re.search(
+            r"(?:automatically found ONTs?|ONT autofind information)[^\r\n]*(?:do(?:es)? not exist|not exist)"
+            r"|(?:number of (?:GPON )?(?:autofind|auto-find) ONTs?)[^\r\n]*(?::|is)\s*0\b"
+            r"|no ONTs? (?:was|were) auto-found", output, re.I))
+
+    @classmethod
+    def parse_discovery(cls, output):
+        results = []
+        current = {}
+
+        def flush():
+            if not current:
+                return
+            if "serial" not in current or "position" not in current:
+                raise AdapterError("A resposta de autofind contém um registro incompleto. Confira o formato da CLI deste firmware.")
+            frame, slot, pon = current["position"]
+            if not (0 <= frame <= 15 and 0 <= slot <= 31 and 0 <= pon <= 31):
+                raise AdapterError("A OLT retornou uma posição PON fora da faixa suportada.")
+            results.append(DiscoveredONT(current["serial"], frame, slot, pon,
+                                         current.get("vendor", ""), current.get("equipment", "")))
+            current.clear()
+
+        for line in output.splitlines():
+            if re.match(r"\s*Number\s*:\s*\d+\s*$", line, re.I):
+                flush()
+                continue
+            position = re.match(r"\s*F\s*/\s*S\s*/\s*P\s*:\s*(\d+)\s*/\s*(\d+)\s*/\s*(\d+)\s*$", line, re.I)
+            if position:
+                if "position" in current:
+                    flush()
+                current["position"] = tuple(map(int, position.groups()))
+                continue
+            serial = re.match(r"\s*ONT\s*SN\s*:\s*([A-Za-z0-9-]+)(?:\s|\(|$)", line, re.I)
+            if serial:
+                normalized = normalize_serial(serial[1])
+                if not re.fullmatch(r"(?:[A-Z]{4}[0-9A-F]{8}|[0-9A-F]{16})", normalized):
+                    raise AdapterError("A resposta de autofind contém um serial fora do formato suportado.")
+                current["serial"] = normalized
+                continue
+            for label, key in [("VendorID", "vendor"), ("EquipmentID", "equipment")]:
+                value = re.match(rf"\s*ONT\s*{label}\s*:\s*(.*?)\s*$", line, re.I)
+                if value:
+                    current[key] = "".join(char for char in value[1] if char.isprintable())[:120]
+        flush()
+        if not results and not cls.empty_discovery(output):
+            raise AdapterError("Não foi possível interpretar a resposta de display ont autofind all. Confira o formato e as permissões da CLI.")
+        unique = {}
+        for item in results:
+            if item.serial in unique and unique[item.serial] != item:
+                raise AdapterError("A busca retornou o mesmo serial em posições ou registros diferentes. Confira a OLT.")
+            unique[item.serial] = item
+        return list(unique.values())
+
+    def discover(self, olt):
+        with self.session(olt) as channel:
+            self.command(channel, "enable")
+            self.command(channel, "config")
+            return self.parse_discovery(self.command(channel, "display ont autofind all"))
 
     def preflight(self, olt):
         if not settings.ENABLE_LIVE_OLT:
@@ -121,7 +214,8 @@ class HuaweiAdapter:
     def command(self, channel, command):
         channel.sendall(command + "\n")
         output = self.read_prompt(channel)
-        if re.search(r"(?:Failure|Error:|Unknown command|Unrecognized command|does not exist|already exists)", output, re.I):
+        empty_search = command == "display ont autofind all" and self.empty_discovery(output)
+        if not empty_search and re.search(r"(?:Failure|Error:|Unknown command|Unrecognized command|does not exist|already exists)", output, re.I):
             raise AdapterError("A OLT rejeitou um comando. Confira o estado e o plano na CLI; a resposta bruta não é salva no ERP.")
         return output
 
@@ -131,12 +225,19 @@ class HuaweiAdapter:
             changing = False
             try:
                 for command in commands:
+                    if onu.discovered_at and command.startswith("interface gpon"):
+                        found = self.parse_discovery(self.command(channel, "display ont autofind all"))
+                        if not any(item.serial == normalize_serial(onu.serial) and
+                                   (item.frame, item.slot, item.pon) == (onu.frame, onu.slot, onu.pon) for item in found):
+                            raise AdapterError("A ONT não está mais no autofind desta PON. Faça uma nova busca e confira o cadastro antes de provisionar.")
                     if command.startswith(("ont add", "service-port")):
                         changing = True
                     self.command(channel, command)
-            except (AdapterError, OSError, paramiko.SSHException):
+            except (AdapterError, OSError, paramiko.SSHException) as exc:
                 if changing:
                     raise UncertainResult("Resultado remoto incerto. Confira ONT e service-port na OLT antes de qualquer nova tentativa.") from None
+                if isinstance(exc, AdapterError):
+                    raise
                 raise AdapterError("A sessão falhou antes do envio de comandos de alteração.") from None
         return "CLI confirmou o cadastro da ONT e do service-port. Configuração persistente da OLT deve seguir a política da sua rede."
 
