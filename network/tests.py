@@ -1,5 +1,6 @@
 import csv
 import io
+import logging
 from unittest.mock import MagicMock, patch
 
 from cryptography.fernet import Fernet
@@ -300,6 +301,20 @@ class NetworkTest(TestCase):
     def test_health_is_public_without_network_data(self):
         self.client.logout()
         self.assertEqual(self.client.get("/health/").json(), {"status": "ok"})
+
+    @override_settings(DEBUG=False)
+    def test_production_500_logs_traceback_without_exposing_it_in_browser(self):
+        self.client.raise_request_exception = False
+        output = io.StringIO()
+        logger = logging.getLogger("django")
+        console = next(handler for handler in logger.handlers if isinstance(handler, logging.StreamHandler))
+        with patch.object(console, "stream", output), patch("network.views.ONU.objects.count", side_effect=RuntimeError("falha-controlada-de-teste")):
+            response = self.client.get("/")
+        self.assertEqual(response.status_code, 500)
+        self.assertIn("Traceback", output.getvalue())
+        self.assertIn("RuntimeError: falha-controlada-de-teste", output.getvalue())
+        self.assertNotContains(response, "falha-controlada-de-teste", status_code=500)
+        self.assertNotContains(response, "Traceback", status_code=500)
 
     def test_real_ssh_host_key_is_never_auto_accepted(self):
         with override_settings(ENABLE_LIVE_OLT=True), patch("paramiko.SSHClient") as client:

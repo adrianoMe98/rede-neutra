@@ -1,8 +1,14 @@
 import os
 from pathlib import Path
+from django.core.exceptions import ImproperlyConfigured
 
 BASE_DIR = Path(__file__).resolve().parent.parent
-SECRET_KEY = os.environ["DJANGO_SECRET_KEY"]
+SECRET_KEY = os.getenv("DJANGO_SECRET_KEY", "")
+if not SECRET_KEY.strip():
+    raise ImproperlyConfigured(
+        "DJANGO_SECRET_KEY ausente ou vazia. Execute scripts/init_env.py no host "
+        "para preencher o .env e recrie o container para carregar a configuração."
+    )
 DEBUG = os.getenv("DJANGO_DEBUG", "0") == "1"
 ALLOWED_HOSTS = os.getenv("DJANGO_ALLOWED_HOSTS", "localhost,127.0.0.1").split(",")
 CSRF_TRUSTED_ORIGINS = list(filter(None, os.getenv("CSRF_TRUSTED_ORIGINS", "").split(",")))
@@ -56,3 +62,23 @@ X_FRAME_OPTIONS = "DENY"
 ENABLE_LIVE_OLT = os.getenv("ENABLE_LIVE_OLT", "0") == "1"
 OLT_CREDENTIAL_KEY = os.getenv("OLT_CREDENTIAL_KEY", "")
 OLT_KNOWN_HOSTS = os.getenv("OLT_KNOWN_HOSTS", str(DATA_DIR / "known_hosts"))
+
+# Django filtra o console padrão com DEBUG=False. Erros precisam aparecer nos
+# logs do container/terminal sem publicar o traceback no navegador.
+LOGGING = {
+    "version": 1,
+    "disable_existing_loggers": False,
+    "formatters": {
+        "server": {"format": "{asctime} {levelname} {name}: {message}", "style": "{"},
+    },
+    "handlers": {
+        "stderr": {
+            "class": "logging.StreamHandler",
+            "stream": "ext://sys.stderr",
+            "formatter": "server",
+        },
+    },
+    "loggers": {
+        "django": {"handlers": ["stderr"], "level": "WARNING", "propagate": False},
+    },
+}

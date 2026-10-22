@@ -63,7 +63,7 @@ python3 -m venv .venv
 .venv/bin/gunicorn config.wsgi:application --bind 0.0.0.0:8000 --workers 2 --threads 4 --timeout 180
 ```
 
-`init_env.py` gera `.env` com permissões restritas e chaves exclusivas, sem sobrescrever configuração existente. `.env`, bancos e credenciais não são versionados. Guarde `DJANGO_SECRET_KEY`, `OLT_CREDENTIAL_KEY` e backups do banco em local seguro; perder a chave de criptografia torna as senhas de OLT armazenadas ilegíveis.
+`init_env.py` gera `.env` com permissões restritas e chaves exclusivas. Se o arquivo já existe, inclusive uma cópia de `.env.example`, preenche somente chaves ausentes ou vazias; chaves preenchidas e demais configurações são preservadas. `.env`, bancos e credenciais não são versionados. Guarde `DJANGO_SECRET_KEY`, `OLT_CREDENTIAL_KEY` e backups do banco em local seguro; perder a chave de criptografia torna as senhas de OLT armazenadas ilegíveis.
 
 Em cada tarefa na nuvem use o checkout existente: o ambiente já é isolado, não é necessário criar worktrees.
 
@@ -113,6 +113,58 @@ docker compose exec web python manage.py test
 Os testes exercitam restrições de cadastro, permissões, CSRF, fluxo completo de simulação, CSV, criptografia, geração de CLI Huawei, parser óptico, falhas parciais, bloqueio de reenvio e reconciliação. A homologação física fica separada desses testes.
 
 ## Publicação e operação
+
+### Diagnosticar Server Error (500)
+
+A página 500 oculta detalhes internos. O traceback fica no terminal ou em `docker compose logs`, inclusive com `DJANGO_DEBUG=0`; mantenha essa configuração em produção. Para coletar o erro no Docker:
+
+```sh
+docker compose ps
+docker compose logs --tail=100 web
+```
+
+Recarregue a página que falhou e consulte os logs novamente. Não compartilhe `.env`, senhas ou chaves. O healthcheck verifica banco e processo, mas uma rota específica ainda pode falhar; o log identifica a causa.
+
+Se **todas as rotas**, inclusive `/health/`, retornam 500 apesar de migrações e coleta de estáticos concluídas, verifique se `DJANGO_SECRET_KEY` está vazia. Versões anteriores do gerador não preenchiam uma cópia existente de `.env.example`. Confira apenas a presença, sem imprimir a chave:
+
+```sh
+docker compose exec -T web python -c "import os; print('DJANGO_SECRET_KEY:', 'definida' if os.getenv('DJANGO_SECRET_KEY', '').strip() else 'VAZIA')"
+```
+
+Para reparar as chaves ausentes/vazias e carregar a configuração atualizada:
+
+```sh
+git pull --ff-only
+.venv/bin/python scripts/init_env.py
+docker compose up -d --build --force-recreate
+```
+
+Em Windows, use `.venv\Scripts\python.exe scripts/init_env.py`. O comando de reparo preserva chaves já preenchidas, configurações existentes e o banco. Recriar o container é necessário: `docker compose restart` sozinho não recarrega o `.env`. Sem uma chave válida, a versão atual interrompe a inicialização com uma mensagem clara em vez de aceitar requisições que falharão.
+
+Em Linux, caso não tenha o ambiente virtual no host, use a imagem já instalada para executar o gerador atualizado, com o usuário dono do projeto:
+
+```sh
+git pull --ff-only
+docker compose run --rm --no-deps --user "$(id -u):$(id -g)" --volume "$PWD:/app" web python scripts/init_env.py
+docker compose up -d --build --force-recreate
+```
+
+Se o log indicar `no such table`, verifique as migrações **na mesma instalação e no mesmo banco usado pelo servidor**:
+
+```sh
+docker compose exec web python manage.py migrate --noinput
+```
+
+Se indicar `Missing staticfiles manifest entry`, execute:
+
+```sh
+docker compose exec web python manage.py collectstatic --noinput
+docker compose restart web
+```
+
+Sem Docker, pare o servidor, execute os comandos correspondentes com o Python do ambiente virtual e reinicie o servidor. Em Linux/macOS, use `.venv/bin/python manage.py ...`; em Windows, `.venv\Scripts\python.exe manage.py ...`. Não apague o banco ou o volume para investigar um erro 500. Outros erros exigem diagnóstico pelo traceback.
+
+### Publicação
 
 Para acesso externo, coloque um proxy com HTTPS à frente da aplicação, ajuste `DJANGO_ALLOWED_HOSTS` e `CSRF_TRUSTED_ORIGINS` para o domínio exato e defina `COOKIE_SECURE=1`. A configuração padrão é local e mantém `DJANGO_DEBUG=0`. A aplicação não assume cabeçalhos de proxy confiáveis; configure essa relação explicitamente na sua infraestrutura.
 

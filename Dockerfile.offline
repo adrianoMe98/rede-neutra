@@ -11,7 +11,7 @@ COPY network network
 COPY templates templates
 COPY static static
 COPY scripts scripts
-COPY manage.py .
+COPY manage.py .env.example ./
 RUN mkdir -p /app/data /app/staticfiles && chown -R erp:erp /app
 USER erp
 EXPOSE 8000
