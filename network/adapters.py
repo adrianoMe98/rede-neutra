@@ -1,6 +1,7 @@
 """Adaptadores isolam a CLI. Simulação nunca abre conexão com equipamentos."""
 import hashlib
 import re
+import socket
 import time
 import unicodedata
 from contextlib import contextmanager
@@ -14,6 +15,10 @@ from .serials import normalize_serial
 
 class AdapterError(Exception):
     """Falha conhecida antes de alterar o equipamento."""
+
+    def __init__(self, message, *, code="cli"):
+        super().__init__(message)
+        self.code = code
 
 
 class UncertainResult(AdapterError):
@@ -41,6 +46,9 @@ class DiscoveredONT:
 
 
 class SimulatedAdapter:
+    def test_connection(self, olt):
+        return "Teste simulado concluído. Nenhuma conexão com uma OLT física foi aberta."
+
     def discover(self, olt):
         prefix = hashlib.sha256(f"olt:{olt.pk}".encode()).hexdigest()[:6].upper()
         return [DiscoveredONT(f"HWTC{prefix}{index:02X}", 0, 1, index - 1, "HWTC", "ONT de demonstração")
@@ -91,6 +99,14 @@ class HuaweiAdapter:
                 f"ont {onu.ont_id} gemport {checked['gem_port']} multi-service user-vlan {checked['user_vlan']} tag-transform translate"]
 
     @staticmethod
+    def clean_output(output):
+        output = re.sub(r"\x1b\][^\x07]*(?:\x07|\x1b\\)", "", output)
+        output = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", output)
+        while "\b" in output:
+            output = re.sub(r"[^\n\b]\x08|^\x08", "", output, flags=re.M)
+        return output.replace("\r", "")
+
+    @staticmethod
     def empty_discovery(output):
         return bool(re.search(
             r"(?:automatically found ONTs?|ONT autofind information)[^\r\n]*(?:do(?:es)? not exist|not exist)"
@@ -99,6 +115,7 @@ class HuaweiAdapter:
 
     @classmethod
     def parse_discovery(cls, output):
+        output = cls.clean_output(output)
         results = []
         current = {}
 
@@ -124,14 +141,14 @@ class HuaweiAdapter:
                     flush()
                 current["position"] = tuple(map(int, position.groups()))
                 continue
-            serial = re.match(r"\s*ONT\s*SN\s*:\s*([A-Za-z0-9-]+)(?:\s|\(|$)", line, re.I)
+            serial = re.match(r"\s*ONT\s*SN(?:\s*\((?:HEX|ASCII)\))?\s*:\s*([A-Za-z0-9-]+)(?:\s|\(|$)", line, re.I)
             if serial:
                 normalized = normalize_serial(serial[1])
                 if not re.fullmatch(r"(?:[A-Z]{4}[0-9A-F]{8}|[0-9A-F]{16})", normalized):
                     raise AdapterError("A resposta de autofind contém um serial fora do formato suportado.")
                 current["serial"] = normalized
                 continue
-            for label, key in [("VendorID", "vendor"), ("EquipmentID", "equipment")]:
+            for label, key in [(r"Vendor\s*ID", "vendor"), (r"Equipment\s*ID", "equipment")]:
                 value = re.match(rf"\s*ONT\s*{label}\s*:\s*(.*?)\s*$", line, re.I)
                 if value:
                     current[key] = "".join(char for char in value[1] if char.isprintable())[:120]
@@ -140,47 +157,80 @@ class HuaweiAdapter:
             raise AdapterError("Não foi possível interpretar a resposta de display ont autofind all. Confira o formato e as permissões da CLI.")
         unique = {}
         for item in results:
-            if item.serial in unique and unique[item.serial] != item:
-                raise AdapterError("A busca retornou o mesmo serial em posições ou registros diferentes. Confira a OLT.")
+            previous = unique.get(item.serial)
+            if previous:
+                if previous.pon_address != item.pon_address:
+                    raise AdapterError("A busca retornou o mesmo serial em posições diferentes. Confira a OLT.")
+                item = DiscoveredONT(item.serial, item.frame, item.slot, item.pon,
+                                     previous.vendor or item.vendor, previous.equipment or item.equipment)
             unique[item.serial] = item
         return list(unique.values())
 
     def discover(self, olt):
-        with self.session(olt) as channel:
+        with self.session(olt, read_only=True) as channel:
             self.command(channel, "enable")
             self.command(channel, "config")
             return self.parse_discovery(self.command(channel, "display ont autofind all"))
 
-    def preflight(self, olt):
-        if not settings.ENABLE_LIVE_OLT:
-            raise AdapterError("SSH real desabilitado. Homologue modelo/firmware e configure ENABLE_LIVE_OLT=1 para habilitar.")
+    def test_connection(self, olt):
+        with self.session(olt, read_only=True):
+            return f"Comunicação SSH confirmada: autenticação, prompt e firmware {olt.firmware} verificados."
+
+    def preflight(self, olt, *, read_only=False):
+        if not read_only and not settings.ENABLE_LIVE_OLT:
+            raise AdapterError("Provisionamento SSH desabilitado. Homologue modelo/firmware e configure ENABLE_LIVE_OLT=1 para habilitar o envio.", code="configuration")
         if not olt.model or not olt.host or not olt.username:
-            raise AdapterError("Preencha modelo/firmware, endereço e usuário da OLT.")
+            raise AdapterError("Preencha modelo/firmware, endereço e usuário da OLT.", code="configuration")
         target = olt.model.upper().replace("-", "").replace(" ", "")
         expected = {"MA5800X7": "MA5800V100R022C11", "MA5683T": "MA5600V800R017C10"}
         if target not in expected or olt.firmware != expected[target]:
-            raise AdapterError("O alvo SSH deve ser MA5800-X7 / MA5800V100R022C11 ou MA5683T / MA5600V800R017C10.")
+            raise AdapterError("O alvo SSH deve ser MA5800-X7 / MA5800V100R022C11 ou MA5683T / MA5600V800R017C10.", code="configuration")
 
     @contextmanager
-    def session(self, olt):
-        self.preflight(olt)
+    def session(self, olt, *, read_only=False):
+        self.preflight(olt, read_only=read_only)
         client = paramiko.SSHClient()
         try:
-            client.load_host_keys(settings.OLT_KNOWN_HOSTS)
+            try:
+                client.load_host_keys(settings.OLT_KNOWN_HOSTS)
+            except (OSError, paramiko.SSHException, paramiko.hostkeys.InvalidHostKey):
+                raise AdapterError("Arquivo known_hosts ausente ou inválido. Cadastre a chave SSH verificada da OLT no arquivo configurado.", code="host_key") from None
             client.set_missing_host_key_policy(paramiko.RejectPolicy())
-            client.connect(olt.host, port=olt.ssh_port, username=olt.username, password=olt.get_password(),
+            host_key_name = olt.host if olt.ssh_port == 22 else f"[{olt.host}]:{olt.ssh_port}"
+            if not client.get_host_keys().lookup(host_key_name):
+                raise AdapterError("A chave SSH desta OLT/porta não está cadastrada em known_hosts. Confira a impressão digital com o responsável pela rede e cadastre a chave.", code="host_key")
+            try:
+                password = olt.get_password()
+            except ValidationError:
+                raise AdapterError("Não foi possível recuperar a senha SSH. Confira OLT_CREDENTIAL_KEY e recadastre a senha da OLT.", code="authentication") from None
+            client.connect(olt.host, port=olt.ssh_port, username=olt.username, password=password,
                            look_for_keys=False, allow_agent=False, timeout=10, auth_timeout=10, banner_timeout=10)
             channel = client.invoke_shell(width=240, height=100)
             self.read_prompt(channel)
             version = self.command(channel, "display version")
             if olt.firmware not in version:
-                raise AdapterError("O firmware informado não corresponde ao retornado pela OLT.")
+                raise AdapterError("A OLT respondeu por SSH, mas o firmware informado não corresponde ao retornado pela OLT.", code="firmware")
         except AdapterError:
             client.close()
             raise
-        except (OSError, paramiko.SSHException, ValidationError):
+        except paramiko.AuthenticationException:
             client.close()
-            raise AdapterError("Conexão SSH não estabelecida. Confira rede, credenciais e a chave verificada em known_hosts.") from None
+            raise AdapterError("A OLT recusou a autenticação SSH. Confira usuário, senha e permissões da conta.", code="authentication") from None
+        except paramiko.BadHostKeyException:
+            client.close()
+            raise AdapterError("A chave SSH recebida difere da chave cadastrada. Confira a impressão digital da OLT antes de atualizar known_hosts.", code="host_key") from None
+        except socket.gaierror:
+            client.close()
+            raise AdapterError("Não foi possível resolver o hostname da OLT. Confira o endereço e o DNS do servidor.", code="network") from None
+        except (TimeoutError, socket.timeout):
+            client.close()
+            raise AdapterError("Tempo de conexão SSH esgotado. Confira IP, porta, rota, VPN e regras de acesso até a OLT.", code="network") from None
+        except (OSError, paramiko.ssh_exception.NoValidConnectionsError):
+            client.close()
+            raise AdapterError("Não foi possível abrir a conexão SSH. Confira IP, porta, serviço SSH e regras de acesso da OLT.", code="network") from None
+        except paramiko.SSHException:
+            client.close()
+            raise AdapterError("Falha na negociação SSH. Confira o serviço SSH e a compatibilidade dos algoritmos do equipamento.", code="ssh") from None
         try:
             yield channel
         finally:
@@ -190,6 +240,7 @@ class HuaweiAdapter:
         deadline = time.monotonic() + 15
         output = ""
         completed_at = -1
+        paged_at = 0
         while time.monotonic() < deadline:
             if channel.recv_ready():
                 chunk = channel.recv(65536).decode("utf-8", "replace")
@@ -198,14 +249,19 @@ class HuaweiAdapter:
                 output += chunk
                 if len(output) > 1_000_000:
                     raise AdapterError("Resposta SSH acima do limite.")
-                if re.search(r"----\s*More", chunk, re.I):
-                    channel.send(" ")
+                cleaned = self.clean_output(output)
+                # O marcador de paginação pode chegar dividido em vários pacotes.
+                markers = list(re.finditer(r"----\s*More[^\n]*?----|--More--", cleaned, re.I))
+                for marker in markers:
+                    if marker.end() > paged_at:
+                        channel.sendall(" ")
+                        paged_at = marker.end()
                 # Huawei pede Enter para finalizar argumentos opcionais da CLI.
-                if len(output) != completed_at and re.search(r"\{\s*<cr>[^\n]*\}\s*:\s*$", output, re.I):
+                if len(output) != completed_at and re.search(r"\{\s*<cr>[^\n]*\}\s*:\s*$", cleaned, re.I):
                     channel.sendall("\n")
                     completed_at = len(output)
-                if re.search(r"(?:^|\n)[^\n]{1,100}[>#]\s*$", output):
-                    return output
+                if re.search(r"(?:^|\n)[ \t]*(?:<[\w.-]+>|[\w.-]+(?:\([^\n]*\))?[>#])[ \t]*$", cleaned):
+                    return cleaned
             if channel.closed or channel.exit_status_ready():
                 raise AdapterError("A OLT encerrou a conexão antes da confirmação.")
             time.sleep(0.05)
@@ -214,9 +270,11 @@ class HuaweiAdapter:
     def command(self, channel, command):
         channel.sendall(command + "\n")
         output = self.read_prompt(channel)
-        empty_search = command == "display ont autofind all" and self.empty_discovery(output)
-        if not empty_search and re.search(r"(?:Failure|Error:|Unknown command|Unrecognized command|does not exist|already exists)", output, re.I):
-            raise AdapterError("A OLT rejeitou um comando. Confira o estado e o plano na CLI; a resposta bruta não é salva no ERP.")
+        errors = re.compile(r"Failure|Error\s*:|Unknown command|Unrecognized command|does not exist|do not exist|already exists|(?:permission|access) denied|insufficient privilege", re.I)
+        for line in output.splitlines():
+            allowed_empty = command == "display ont autofind all" and self.empty_discovery(line)
+            if errors.search(line) and not allowed_empty:
+                raise AdapterError("A OLT rejeitou um comando da CLI. Confira as permissões da conta SSH e o formato suportado pelo firmware; a resposta bruta não é salva no ERP.")
         return output
 
     def provision(self, onu):
@@ -255,7 +313,7 @@ class HuaweiAdapter:
         return OpticalReading(tx=values["Tx"], rx=values["Rx"])
 
     def optics(self, onu):
-        with self.session(onu.olt) as channel:
+        with self.session(onu.olt, read_only=True) as channel:
             for command in ["enable", "config", f"interface gpon {onu.frame}/{onu.slot}"]:
                 self.command(channel, command)
             return self.parse_optics(self.command(channel, f"display ont optical-info {onu.pon} {onu.ont_id}"))

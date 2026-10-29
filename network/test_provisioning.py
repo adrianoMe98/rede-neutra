@@ -198,7 +198,9 @@ class ProvisioningWorkflowTest(TestCase):
         self.assertEqual(Operation.objects.get().actor, self.operator)
         ssh.assert_not_called()
         _, rows = scan_olt(self.olt, self.operator)
-        self.assertNotIn(item.serial, [row["item"].serial for row in rows])
+        returned = next(row for row in rows if row["item"].serial == item.serial)
+        self.assertEqual(returned["existing"].status, ONU.Status.ACTIVE)
+        self.assertEqual(returned["token"], "")
 
     def test_signed_discovery_selection_cannot_be_changed(self):
         _, rows = scan_olt(self.olt, self.operator)
@@ -267,6 +269,26 @@ class ProvisioningWorkflowTest(TestCase):
             response = self.client.post(reverse("onu_discovery"), {"olt": self.olt.pk})
         self.assertContains(response, "Nenhuma ONT disponível")
         self.assertEqual(DiscoveryScan.objects.get().outcome, "success")
+        self.assertContains(response, "A OLT informou que não há ONTs no autofind")
+
+    def test_onu_registered_active_remains_visible_when_returned_by_autofind(self):
+        onu = self.create_onu()
+        ONU.objects.filter(pk=onu.pk).update(status=ONU.Status.ACTIVE)
+        with patch.object(SimulatedAdapter, "discover", return_value=[DiscoveredONT(onu.serial, 0, 1, 0)]):
+            response = self.client.post(reverse("onu_discovery"), {"olt": self.olt.pk})
+        self.assertEqual(response.context["scan"].count, 1)
+        self.assertEqual(response.context["available_count"], 0)
+        self.assertEqual(response.context["review_count"], 1)
+        self.assertEqual(len(response.context["rows"]), 1)
+        self.assertContains(response, "O ERP marca como provisionada")
+        self.assertContains(response, "Conferir cadastro")
+
+    def test_inventory_search_accepts_ascii_dashed_and_hex_serials(self):
+        self.create_onu()
+        for query in ("HWTCABCD1234", "HWTC-ABCD1234", "48575443ABCD1234"):
+            with self.subTest(query=query):
+                response = self.client.get(reverse("onu_list"), {"q": query})
+                self.assertEqual(response.context["items"].paginator.count, 1)
 
     def test_discovered_ont_must_still_be_on_same_pon_before_huawei_mutation(self):
         onu = self.create_onu()

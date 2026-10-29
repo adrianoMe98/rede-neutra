@@ -1,0 +1,6 @@
+{% if connection_test %}
+<section class="panel connection-result" role="status">
+  <div class="panel-heading"><div><h2>{% if connection_test.simulation %}Teste de comunicação simulado{% elif connection_test.success %}Comunicação SSH confirmada{% else %}Teste de comunicação não concluído{% endif %}</h2><p>{{ connection_test.created_at|date:'d/m/Y H:i:s' }} · {{ connection_test.duration_ms }} ms · {{ connection_test.target }}</p></div><span class="badge {% if connection_test.simulation %}simulation{% elif connection_test.success %}success{% else %}failed{% endif %}">{% if connection_test.simulation %}Simulação{% elif connection_test.success %}Sucesso{% else %}Falha{% endif %}</span></div>
+  <div class="connection-detail"><strong>Etapa: {{ connection_test.get_stage_display }}</strong><p>{{ connection_test.detail }}</p><small>O resultado registra a comunicação no momento do teste. As consultas usam os dados salvos da OLT.</small></div>
+</section>
+{% endif %}

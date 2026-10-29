@@ -1,0 +1,13 @@
+{% extends 'base.html' %}
+{% block subtitle %}<p>Verifique a conexão SSH, a autenticação, o prompt e o firmware do equipamento.</p>{% endblock %}
+{% block actions %}<div class="actions"><a class="button secondary" href="{% url 'catalog_edit' 'olts' olt.pk %}">Editar OLT</a><a class="button secondary" href="{% url 'catalog' 'olts' %}">← OLTs</a></div>{% endblock %}
+{% block content %}
+<section class="panel"><div class="panel-heading"><div><h2>{{ olt.name }}</h2><p>{{ olt.get_vendor_display }} · {{ olt.model|default:'Modelo não informado' }} · {{ olt.firmware|default:'Firmware não informado' }}</p></div><span class="badge {% if olt.mode == 'simulation' %}simulation{% else %}draft{% endif %}">{{ olt.get_mode_display }}</span></div>
+<form class="communication-form" method="post">{% csrf_token %}
+  <p>{% if olt.mode == 'simulation' %}Esta OLT está em simulação. O teste demonstrativo será identificado no resultado.{% else %}Destino salvo: <strong class="mono">{{ olt.host }}:{{ olt.ssh_port }}</strong>. O teste verifica a chave SSH cadastrada, faz a autenticação e consulta <code>display version</code>.{% endif %}</p>
+  <p class="hint">Salve alterações no cadastro antes de executar. Testes e buscas são consultas; o provisionamento continua sujeito à liberação de envio.</p>
+  <button type="submit" class="button primary">Testar comunicação</button>
+</form></section>
+{% include 'network/connection_result.html' %}
+{% if history %}<section class="panel"><div class="panel-heading"><div><h2>Últimos testes</h2><p>Histórico de até 20 testes desta OLT.</p></div></div><div class="table-wrap"><table><thead><tr><th>Data / responsável</th><th>Destino</th><th>Resultado / etapa</th><th>Duração</th><th>Detalhes</th></tr></thead><tbody>{% for item in history %}<tr><td>{{ item.created_at|date:'d/m/Y H:i:s' }}<small>{{ item.actor.username|default:'Usuário removido' }}</small></td><td>{{ item.target }}</td><td><span class="badge {% if item.simulation %}simulation{% elif item.success %}success{% else %}failed{% endif %}">{% if item.simulation %}Simulação{% elif item.success %}Sucesso{% else %}Falha{% endif %}</span><small>{{ item.get_stage_display }}</small></td><td>{{ item.duration_ms }} ms</td><td class="wrap-cell">{{ item.detail }}</td></tr>{% endfor %}</tbody></table></div></section>{% endif %}
+{% endblock %}

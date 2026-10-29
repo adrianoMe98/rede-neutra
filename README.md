@@ -11,6 +11,7 @@ ERP web para cadastro e provisionamento de ONTs/ONUs em uma rede neutra. Interfa
 - Reserva exclusiva de porta na CTO, ONT ID por PON e service-port por OLT; validação da capacidade da CTO e do provedor da VLAN.
 - Plano de provisionamento, confirmação pelo operador, execução e histórico com usuário/data/resultado.
 - Busca de ONTs não provisionadas por OLT, usando `display ont autofind all` no adaptador Huawei, com seleção da ONT e preenchimento de serial e PON.
+- Teste de comunicação por OLT e na tela de busca, com diagnóstico de chave SSH, rede, autenticação, CLI e firmware, e histórico por operador.
 - Perfis de provisionamento por provedor/OLT com VLAN de serviço, VLAN do cliente, line profile, service profile e GEM port. Os parâmetros são copiados para o cadastro da ONU e preservados após edições do perfil.
 - Consulta pontual de TX/RX **na ONU**, em dBm, com data da leitura. O estado “Provisionada” indica sucesso do cadastro na integração, e não monitoração online/offline.
 - Relatórios com filtros por descrição/serial, provedor, situação, VLAN, CTO e OLT, e exportação CSV compatível com Excel. Leituras simuladas são identificadas na tela e no CSV.
@@ -87,7 +88,17 @@ O adaptador Huawei consulta `display ont autofind all`, gera `ont add` por SN/OM
 4. Selecione o perfil para preencher provedor, OLT e VLAN, informe cliente e CTO/porta, e reserve ONT ID e service-port livres. As sugestões de IDs consideram **somente o inventário local** e não garantem disponibilidade física na OLT.
 5. Clique em **Salvar e revisar provisionamento**, confira o plano e confirme o envio. Para ONTs vindas da busca, o adaptador Huawei consulta novamente o autofind antes de `ont add`; se o serial não estiver na mesma PON, nenhum comando de alteração será enviado.
 
-Buscas exigem usuário operador e proteção CSRF. O histórico guarda OLT, usuário, data, quantidade e resultado, sem armazenar a resposta bruta da CLI, LOID ou senha das ONTs. O parser suporta registros Huawei com `F/S/P`, `Ont SN`, `Ont VendorID` e `Ont EquipmentID`; formatos desconhecidos geram erro de interpretação em vez de um resultado vazio incorreto. A homologação dos retornos do firmware real continua necessária.
+Buscas exigem usuário operador e proteção CSRF. O histórico guarda OLT, usuário, data, quantidade e resultado, sem armazenar a resposta bruta da CLI, LOID ou senha das ONTs. O parser suporta registros Huawei com `F/S/P`, `Ont SN`, `Ont VendorID` e `Ont EquipmentID`, variações de espaços, rótulos SN (HEX/ASCII) e códigos de cor do terminal; formatos desconhecidos geram erro de interpretação em vez de um resultado vazio incorreto. A paginação dividida entre pacotes SSH é tratada. A homologação dos retornos do firmware real continua necessária.
+
+A tela informa a quantidade retornada pela OLT, a quantidade disponível para continuar e quantas ONTs exigem conferência. Uma ONU marcada como provisionada no ERP permanece visível se a OLT ainda a retorna no autofind, com aviso e acesso para conferir o cadastro; um novo envio automático é bloqueado. A lista só fica vazia quando a consulta interpretada da OLT realmente não contém ONTs. Erros de permissão da CLI geram falha explícita. A busca textual do inventário reconhece seriais Huawei nos formatos ASCII, ASCII com hífen e hexadecimal.
+
+### Testar a comunicação com a OLT
+
+Em **OLTs**, clique em **Testar comunicação** na linha do equipamento; o mesmo acesso está na edição de uma OLT já salva. Confirme os dados salvos e execute o teste. Na tela de descoberta também é possível selecionar uma OLT e clicar em **Testar comunicação**, antes da busca.
+
+Em SSH, o teste valida a chave cadastrada em `known_hosts`, abre a conexão na porta configurada, autentica, recebe o prompt e executa `display version` para conferir o firmware. O resultado mostra a etapa que falhou (configuração, chave SSH, rede/porta, negociação SSH, autenticação, CLI ou firmware), tempo decorrido e data. O histórico armazena destino e responsável, sem senha ou transcrição bruta da sessão. Um teste bem-sucedido registra o estado naquele momento, sem monitoramento contínuo.
+
+Testes, autofind e leituras ópticas são consultas e funcionam com `ENABLE_LIVE_OLT=0`. O envio de provisionamento continua bloqueado até `ENABLE_LIVE_OLT=1`. A OLT deve estar no modo SSH com modelo/firmware suportados e credenciais válidas; no modo simulação, o resultado é demonstrativo e nenhuma conexão física é aberta. Chaves SSH desconhecidas ou alteradas são recusadas; para portas diferentes de 22, a entrada em `known_hosts` deve usar `[host]:porta`.
 
 Os perfis funcionam como modelos de parâmetros no ERP. Alterações futuras de nome ou IDs do perfil não modificam o conjunto já copiado para uma ONU cadastrada; para mudar os parâmetros de um cadastro ainda não provisionado, selecione outro perfil. Não é permitido trocar provedor, OLT ou VLAN de um perfil em uso. Desativar um perfil impede sua seleção em novos cadastros.
 
@@ -99,7 +110,7 @@ Para homologar SSH em laboratório:
 2. Garanta que a máquina/container alcança o endereço de gerenciamento. Libere apenas o destino necessário nas configurações de rede do ambiente. Uma VPN deve ser configurada pelo ambiente, sem cliente VPN dentro do container.
 3. Cadastre o modelo e o firmware exatos, usuário dedicado, senha, perfis existentes e GEM port. A senha é criptografada no banco com Fernet; não é exibida novamente. A rotação da chave exige recadastrar as senhas ou fazer migração própria.
 4. Instale em `data/known_hosts` (ou `OLT_KNOWN_HOSTS`) a chave SSH da OLT, conferindo a impressão digital por um canal confiável com o administrador. Em Docker o arquivo deve estar dentro do volume `/app/data`, legível pelo UID 10001. Chaves desconhecidas ou alteradas são recusadas. Não use aceitação automática nem habilite algoritmos legados sem avaliação específica.
-5. Defina `ENABLE_LIVE_OLT=1` no `.env` **depois de revisar a CLI e homologar os perfis**, e recrie o container: `docker compose up -d --force-recreate`. O padrão é `0` e bloqueia conexão real. Configure a OLT como SSH somente nessa etapa.
+5. Configure a OLT como SSH e use **Testar comunicação** e **Buscar ONTs não provisionadas** para validar as consultas. O padrão `ENABLE_LIVE_OLT=0` mantém o envio de provisionamento bloqueado. **Depois de revisar a CLI e homologar os perfis**, defina `ENABLE_LIVE_OLT=1` no `.env` e recrie o container: `docker compose up -d --force-recreate`.
 6. Reserve uma porta CTO, posição GPON/ONT e service-port livres, confira o plano e teste com uma ONU de laboratório. Confirme na CLI a configuração e a leitura óptica. Não forneça senhas no chat nem no repositório.
 
 O ERP não executa `save`, reboot, exclusão remota ou rollback automático. Siga a política operacional da rede para persistir a configuração da OLT. Uma falha após `ont add` pode deixar configuração parcial; o ERP bloqueia o reenvio e marca **Conferir na OLT**. Uma interrupção do processo também pode deixar **Em provisionamento**; confira o estado antes de reconciliar. Não repita comandos manualmente sem verificar a OLT.

@@ -1,5 +1,6 @@
 {% extends 'base.html' %}
 {% block subtitle %}<p>Preencha os dados para manter sua rede organizada.</p>{% endblock %}
+{% block actions %}{% if olt_for_test %}<a class="button secondary" href="{% url 'olt_communication' olt_for_test.pk %}">Testar comunicação</a>{% endif %}{% endblock %}
 {% block content %}
 <form method="post" class="panel edit-form" data-discovered-olt="{{ discovered.olt|default:'' }}">{% csrf_token %}
 {% if form.non_field_errors %}<div class="notice error">{{ form.non_field_errors }}</div>{% endif %}

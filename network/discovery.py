@@ -29,8 +29,8 @@ def scan_olt(olt, actor):
     for item in found:
         onu = existing.get(item.serial)
         position_matches = not onu or (onu.olt_id, onu.frame, onu.slot, onu.pon) == (olt.pk, item.frame, item.slot, item.pon)
-        if onu and onu.status == ONU.Status.ACTIVE and position_matches:
-            continue
+        # O autofind é a evidência da OLT. Um estado antigo no ERP não deve
+        # ocultar uma ONT que o equipamento ainda retorna como descoberta.
         payload = {"scan": scan.pk, "olt": olt.pk, **asdict(item)}
         can_continue = not onu or (onu.status == ONU.Status.DRAFT and position_matches)
         rows.append({"item": item, "existing": onu, "position_matches": position_matches,

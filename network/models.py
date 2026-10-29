@@ -231,6 +231,27 @@ class DiscoveryScan(models.Model):
         ordering = ["-created_at"]
 
 
+class OLTConnectionTest(models.Model):
+    STAGES = [
+        ("ready", "Concluído"), ("configuration", "Configuração"), ("host_key", "Chave SSH"),
+        ("network", "Rede / porta SSH"), ("ssh", "Negociação SSH"),
+        ("authentication", "Autenticação"), ("cli", "CLI / permissões"),
+        ("firmware", "Firmware"), ("unexpected", "Falha inesperada"),
+    ]
+    olt = models.ForeignKey(OLT, on_delete=models.PROTECT, related_name="connection_tests")
+    actor = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, on_delete=models.SET_NULL)
+    success = models.BooleanField()
+    simulation = models.BooleanField()
+    stage = models.CharField(max_length=20, choices=STAGES)
+    target = models.CharField(max_length=270)
+    detail = models.TextField()
+    duration_ms = models.PositiveIntegerField()
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-created_at", "-pk"]
+
+
 class Operation(models.Model):
     onu = models.ForeignKey(ONU, on_delete=models.PROTECT, related_name="operations")
     actor = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, on_delete=models.SET_NULL)

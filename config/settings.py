@@ -58,7 +58,7 @@ CSRF_COOKIE_SECURE = SESSION_COOKIE_SECURE
 SECURE_CONTENT_TYPE_NOSNIFF = True
 SECURE_REFERRER_POLICY = "same-origin"
 X_FRAME_OPTIONS = "DENY"
-# Ative somente após homologar o modelo/firmware e conferir as prévias de CLI.
+# Habilita alterações na OLT após homologação. Consultas e teste SSH são somente leitura.
 ENABLE_LIVE_OLT = os.getenv("ENABLE_LIVE_OLT", "0") == "1"
 OLT_CREDENTIAL_KEY = os.getenv("OLT_CREDENTIAL_KEY", "")
 OLT_KNOWN_HOSTS = os.getenv("OLT_KNOWN_HOSTS", str(DATA_DIR / "known_hosts"))

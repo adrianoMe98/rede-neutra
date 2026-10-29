@@ -6,16 +6,18 @@ from django.contrib.auth.decorators import login_required
 from django.core.exceptions import PermissionDenied, ValidationError
 from django.core.paginator import Paginator
 from django.db import IntegrityError
-from django.db.models import Count, Q
+from django.db.models import Count, OuterRef, Q, Subquery
 from django.http import HttpResponse, JsonResponse
 from django.shortcuts import get_object_or_404, redirect, render
 from django.views.decorators.http import require_POST
 
 from .adapters import AdapterError, get_adapter
+from .communication import check_olt_connection
 from .discovery import load_discovery, scan_olt, validate_selection
 from .forms import CTOForm, DiscoveryForm, OLTForm, ONUForm, ProviderForm, ProvisioningProfileForm, VlanForm
-from .models import CTO, OLT, ONU, DiscoveryScan, Operation, Provider, ProvisioningProfile, Vlan
+from .models import CTO, OLT, ONU, DiscoveryScan, OLTConnectionTest, Operation, Provider, ProvisioningProfile, Vlan
 from .services import provision, refresh_optics
+from .serials import serial_aliases
 
 
 def operator(view):
@@ -70,6 +72,13 @@ def catalog(request, kind):
         items = items.select_related("provider", "vlan", "olt").annotate(onu_count=Count("onus"))
     else:
         items = items.annotate(onu_count=Count("onus"))
+    if kind == "olts":
+        latest = OLTConnectionTest.objects.filter(olt_id=OuterRef("pk"))
+        items = items.annotate(
+            last_test_at=Subquery(latest.values("created_at")[:1]),
+            last_test_success=Subquery(latest.values("success")[:1]),
+            last_test_simulation=Subquery(latest.values("simulation")[:1]),
+        )
     items = items.order_by("number" if kind == "vlans" else "name")
     q = request.GET.get("q", "").strip()
     if q:
@@ -97,6 +106,7 @@ def catalog_edit(request, kind, pk=None):
             form.add_error(None, "Este cadastro já existe ou conflita com outro registro.")
     return render(request, "network/form.html", {"form": form, "title": f"{'Editar' if pk else 'Cadastrar'} {singular}",
                                                  "page": kind, "kind": kind, "back_url": f"/cadastros/{kind}/",
+                                                 "olt_for_test": obj if kind == "olts" else None,
                                                  "vlans_data": list(Vlan.objects.values("id", "provider_id"))})
 
 
@@ -104,7 +114,7 @@ def filtered_onus(request):
     query = ONU.objects.select_related("provider", "vlan", "cto", "olt")
     q = request.GET.get("q", "").strip()
     if q:
-        query = query.filter(Q(subscriber__icontains=q) | Q(serial__icontains=q) | Q(provider__name__icontains=q) | Q(cto__name__icontains=q))
+        query = query.filter(Q(subscriber__icontains=q) | Q(serial__icontains=q) | Q(serial__in=serial_aliases(q)) | Q(provider__name__icontains=q) | Q(cto__name__icontains=q))
     for field in ("provider", "vlan", "cto", "olt"):
         value = request.GET.get(field, "")
         if value.isdigit():
@@ -173,15 +183,33 @@ def onu_edit(request, pk=None):
 @operator
 def onu_discovery(request):
     form = DiscoveryForm(request.POST if request.method == "POST" else None)
-    scan, rows = None, []
+    scan, rows, connection_test = None, [], None
     if request.method == "POST" and form.is_valid():
-        try:
-            scan, rows = scan_olt(form.cleaned_data["olt"], request.user)
-        except AdapterError as exc:
-            form.add_error(None, str(exc))
+        if request.POST.get("action", "discover") == "test_connection":
+            connection_test = check_olt_connection(form.cleaned_data["olt"], request.user)
+        else:
+            try:
+                scan, rows = scan_olt(form.cleaned_data["olt"], request.user)
+            except AdapterError as exc:
+                form.add_error(None, str(exc))
     return render(request, "network/discovery.html", {"form": form, "scan": scan, "rows": rows,
         "history": DiscoveryScan.objects.filter(actor=request.user).select_related("olt")[:5],
-        "title": "Buscar ONTs não provisionadas", "page": "onus"})
+        "title": "Buscar ONTs não provisionadas", "page": "onus", "connection_test": connection_test,
+        "available_count": sum(bool(row["token"]) for row in rows),
+        "review_count": sum(not bool(row["token"]) for row in rows)})
+
+
+@operator
+def olt_communication(request, pk):
+    olt = get_object_or_404(OLT, pk=pk)
+    if request.method == "POST":
+        check_olt_connection(olt, request.user)
+        return redirect("olt_communication", pk=olt.pk)
+    history = olt.connection_tests.select_related("actor")[:20]
+    return render(request, "network/communication.html", {
+        "olt": olt, "history": history, "connection_test": history[0] if history else None,
+        "page": "olts", "title": f"Comunicação · {olt.name}",
+    })
 
 
 @login_required

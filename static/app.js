@@ -57,10 +57,17 @@ document.addEventListener('DOMContentLoaded', () => {
     applyProfile();
   }
   update();
-  document.querySelectorAll('.provision-form, .panel-action, .discovery-form').forEach(form => {
-    form.addEventListener('submit', () => {
-      const button = form.querySelector('button[type="submit"]');
-      if (button) { button.disabled = true; button.textContent = 'Processando…'; }
+  document.querySelectorAll('.provision-form, .panel-action, .discovery-form, .communication-form').forEach(form => {
+    form.addEventListener('submit', event => {
+      // Preservar a ação escolhida: botões desabilitados não entram no POST.
+      const clicked = event.submitter;
+      if (clicked?.name) {
+        const action = document.createElement('input');
+        action.type = 'hidden'; action.name = clicked.name; action.value = clicked.value;
+        form.appendChild(action);
+      }
+      form.querySelectorAll('button[type="submit"]').forEach(button => { button.disabled = true; });
+      if (clicked) clicked.textContent = 'Processando…';
     });
   });
 });
