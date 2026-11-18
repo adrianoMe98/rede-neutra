@@ -5,8 +5,11 @@ services:
     env_file: .env
     environment:
       DATA_DIR: /app/data
+    networks:
+      containers:
+        ipv4_address: "${ENDERECO_IP:?Defina ENDERECO_IP no .env}"
     ports:
-      - "127.0.0.1:${ERP_PORT:-8000}:8000"
+      - "${ERP_PORT:-8000}:8000"
     volumes:
       - erp_data:/app/data
     restart: unless-stopped
@@ -23,3 +26,6 @@ services:
 
 volumes:
   erp_data:
+networks:
+  containers: 
+    external: true
