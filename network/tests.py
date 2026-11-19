@@ -21,6 +21,8 @@ from .services import provision, refresh_optics
 @override_settings(STORAGES={"default": {"BACKEND": "django.core.files.storage.FileSystemStorage"},
                              "staticfiles": {"BACKEND": "django.contrib.staticfiles.storage.StaticFilesStorage"}})
 class NetworkTest(TestCase):
+    databases = {"default", "inventory"}
+
     @classmethod
     def setUpTestData(cls):
         cls.operator = get_user_model().objects.create_user("operador", password="test-only-Op!42", is_staff=True)

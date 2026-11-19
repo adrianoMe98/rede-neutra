@@ -19,4 +19,6 @@ urlpatterns = [
     path("relatorios/", views.onu_list, {"report": True}, name="reports"),
     path("relatorios/exportar/", views.export_csv, name="export_csv"),
     path("relatorios/onts-por-vlan/", views.olt_inventory, name="olt_inventory"),
+    path("relatorios/onts-por-vlan/coletar/", views.inventory_collect, name="inventory_collect"),
+    path("relatorios/onts-por-vlan/coletas/<int:pk>/xlsx/", views.inventory_history_download, name="inventory_history_download"),
 ]

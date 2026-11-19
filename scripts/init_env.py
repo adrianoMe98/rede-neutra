@@ -10,6 +10,7 @@ from dotenv import dotenv_values, set_key
 GENERATORS = {
     "DJANGO_SECRET_KEY": lambda: secrets.token_urlsafe(64),
     "OLT_CREDENTIAL_KEY": lambda: Fernet.generate_key().decode(),
+    "INVENTORY_DB_PASSWORD": lambda: secrets.token_urlsafe(48),
 }
 
 

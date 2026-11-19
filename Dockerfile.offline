@@ -7,6 +7,7 @@ COPY requirements.txt .
 COPY .wheelhouse /wheels
 RUN pip install --no-index --find-links=/wheels -r requirements.txt && rm -rf /wheels && groupadd --gid 10001 erp && useradd --uid 10001 --gid erp --no-create-home erp
 COPY config config
+COPY inventory inventory
 COPY network network
 COPY templates templates
 COPY static static

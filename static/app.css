@@ -3,3 +3,7 @@
 .discovery-form{padding:24px}.discovery-controls{display:flex;gap:18px;align-items:flex-end;flex-wrap:wrap}.discovery-controls .field{flex:1;min-width:240px;max-width:520px}.hint{font-size:11px;line-height:1.7;color:var(--muted);margin:14px 0 0}.hint code{background:#f1f4f1;padding:3px 5px;border-radius:4px;font-size:10px}.description-preview .hint{margin-top:12px}.discovery-panel select{width:100%}@media(max-width:640px){.discovery-form{padding:18px}.discovery-controls .field{min-width:100%}.discovery-controls .button{width:100%}.form-footer{flex-wrap:wrap}.form-footer .button{white-space:normal}}
 
 .communication-form,.connection-detail{padding:24px;font-size:12px;line-height:1.8}.communication-form .button{margin-top:18px}.connection-detail p{margin:10px 0}.connection-detail small{color:var(--muted)}td .text-link+.button{margin-left:16px}@media(max-width:640px){.communication-form,.connection-detail{padding:18px}}
+
+.inventory-history-row{display:flex;align-items:center;justify-content:space-between;gap:16px}
+.inventory-history-row+.inventory-history-row{margin-top:10px}
+.inventory-history-row .text-link{white-space:nowrap}

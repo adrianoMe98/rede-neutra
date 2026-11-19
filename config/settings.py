@@ -14,7 +14,7 @@ ALLOWED_HOSTS = os.getenv("DJANGO_ALLOWED_HOSTS", "localhost,127.0.0.1").split("
 CSRF_TRUSTED_ORIGINS = list(filter(None, os.getenv("CSRF_TRUSTED_ORIGINS", "").split(",")))
 INSTALLED_APPS = [
     "django.contrib.admin", "django.contrib.auth", "django.contrib.contenttypes",
-    "django.contrib.sessions", "django.contrib.messages", "django.contrib.staticfiles", "network",
+    "django.contrib.sessions", "django.contrib.messages", "django.contrib.staticfiles", "network", "inventory",
 ]
 MIDDLEWARE = [
     "django.middleware.security.SecurityMiddleware", "whitenoise.middleware.WhiteNoiseMiddleware",
@@ -32,6 +32,21 @@ WSGI_APPLICATION = "config.wsgi.application"
 DATA_DIR = Path(os.getenv("DATA_DIR", BASE_DIR / "data"))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 DATABASES = {"default": {"ENGINE": "django.db.backends.sqlite3", "NAME": DATA_DIR / "db.sqlite3", "OPTIONS": {"timeout": 30}}}
+if os.getenv("INVENTORY_DB_HOST"):
+    DATABASES["inventory"] = {
+        "ENGINE": "django.db.backends.postgresql",
+        "NAME": os.getenv("INVENTORY_DB_NAME", "rede_neutra_inventory"),
+        "USER": os.getenv("INVENTORY_DB_USER", "erp_inventory"),
+        "PASSWORD": os.getenv("INVENTORY_DB_PASSWORD", ""),
+        "HOST": os.environ["INVENTORY_DB_HOST"],
+        "PORT": os.getenv("INVENTORY_DB_PORT", "5432"),
+        "OPTIONS": {"connect_timeout": 5},
+    }
+else:
+    DATABASES["inventory"] = {
+        "ENGINE": "django.db.backends.sqlite3", "NAME": DATA_DIR / "inventory.sqlite3", "OPTIONS": {"timeout": 30},
+    }
+DATABASE_ROUTERS = ["inventory.router.InventoryRouter"]
 AUTH_PASSWORD_VALIDATORS = [
     {"NAME": "django.contrib.auth.password_validation.UserAttributeSimilarityValidator"},
     {"NAME": "django.contrib.auth.password_validation.MinimumLengthValidator"},

@@ -7,12 +7,17 @@ from django.contrib.auth.decorators import login_required
 from django.core import signing
 from django.core.exceptions import PermissionDenied, ValidationError
 from django.core.paginator import Paginator
-from django.db import IntegrityError, OperationalError, transaction
+from django.db import DatabaseError, IntegrityError, OperationalError, transaction
 from django.db.models import Count, Exists, OuterRef, ProtectedError, Q, Subquery
 from django.http import FileResponse, HttpResponse, JsonResponse
 from django.shortcuts import get_object_or_404, redirect, render
 from django.urls import reverse
-from django.views.decorators.http import require_http_methods, require_POST
+from django.utils import timezone
+from django.utils.text import slugify
+from django.views.decorators.http import require_GET, require_http_methods, require_POST
+
+from inventory.models import InventoryRun, ProviderSnapshot
+from inventory.services import enqueue_inventory, latest_complete_snapshots
 
 from .adapters import AdapterError, get_adapter
 from .communication import check_olt_connection
@@ -23,7 +28,6 @@ from .forms import (
 )
 from .inventory_xlsx import inventory_workbook
 from .models import CTO, OLT, ONU, DiscoveryScan, OLTConnectionTest, Operation, Provider, ProvisioningProfile, Vlan
-from .olt_inventory import provider_targets
 from .services import provision, refresh_optics
 from .serials import serial_aliases
 
@@ -46,12 +50,26 @@ def health(request):
 
 @login_required
 def dashboard(request):
+    providers = list(Provider.objects.annotate(
+        onu_count=Count("onus"), provisioned_count=Count("onus", filter=Q(onus__status=ONU.Status.ACTIVE)),
+    ))
+    inventory_unavailable = False
+    try:
+        snapshots = {
+            snapshot.provider_id: snapshot
+            for snapshot in latest_complete_snapshots([provider.pk for provider in providers])
+        }
+    except DatabaseError:
+        inventory_unavailable = True
+        snapshots = {}
+    for provider in providers:
+        provider.inventory = snapshots.get(provider.pk)
     return render(request, "network/dashboard.html", {
         "total": ONU.objects.count(), "active": ONU.objects.filter(status=ONU.Status.ACTIVE).count(),
         "providers_count": Provider.objects.filter(active=True).count(), "ctos_count": CTO.objects.count(),
         "recent": ONU.objects.select_related("provider", "vlan", "cto", "olt")[:6],
         "operations": Operation.objects.select_related("onu__provider", "actor")[:5],
-        "providers": Provider.objects.annotate(onu_count=Count("onus"))[:6],
+        "providers": providers, "inventory_unavailable": inventory_unavailable,
         "simulations": OLT.objects.filter(mode="simulation").count(),
         "review_count": ONU.objects.filter(status__in=[ONU.Status.REVIEW, ONU.Status.RUNNING]).count(),
         "page": "dashboard", "title": "Visão geral",
@@ -244,17 +262,60 @@ def onu_list(request, report=False):
 @require_http_methods(["GET", "POST"])
 def olt_inventory(request):
     form = InventoryForm(request.POST if request.method == "POST" else None)
-    if request.method == "POST" and form.is_valid():
-        provider = form.cleaned_data["provider"]
-        targets = provider_targets(provider)
-        if targets:
-            return FileResponse(
-                inventory_workbook(provider, targets), as_attachment=True, filename=f"onts-provedor-{provider.pk}.xlsx",
-                content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                headers={"Cache-Control": "private, no-store"},
-            )
-        form.add_error("provider", "Este provedor não tem OLT e VLAN vinculadas por perfil ou cadastro de ONU.")
-    return render(request, "network/olt_inventory.html", {"form": form, "title": "Inventário de ONTs por VLAN", "page": "reports"})
+    history, unavailable = None, False
+    try:
+        if request.method == "POST" and form.is_valid():
+            provider = form.cleaned_data["provider"]
+            snapshot = latest_complete_snapshots([provider.pk]).first()
+            if snapshot:
+                return inventory_download(snapshot)
+            form.add_error("provider", "Ainda não há uma coleta com todas as VLANs lidas para este provedor. Confira o histórico.")
+        runs = InventoryRun.objects.prefetch_related("providers")
+        history = Paginator(runs, 12).get_page(request.GET.get("page"))
+        history.object_list = list(history.object_list)
+    except DatabaseError:
+        unavailable = True
+    return render(request, "network/olt_inventory.html", {
+        "form": form, "history": history, "inventory_unavailable": unavailable,
+        "title": "Inventário de ONTs por VLAN", "page": "reports",
+    }, status=503 if unavailable else 200)
+
+
+@operator
+@require_POST
+def inventory_collect(request):
+    try:
+        run = enqueue_inventory(requested_by=request.user.get_username())
+    except DatabaseError:
+        messages.error(request, "O banco de inventário está indisponível. Tente novamente quando o serviço voltar.")
+    else:
+        if run:
+            messages.success(request, "Coleta solicitada. Acompanhe o resultado no histórico.")
+        else:
+            messages.info(request, "Já existe uma coleta na fila ou em andamento.")
+    return redirect("olt_inventory")
+
+
+@operator
+@require_GET
+def inventory_history_download(request, pk):
+    try:
+        snapshot = get_object_or_404(ProviderSnapshot.objects.select_related("run"), pk=pk)
+        return inventory_download(snapshot)
+    except DatabaseError:
+        messages.error(request, "O banco de inventário está indisponível. Tente novamente quando o serviço voltar.")
+        return redirect("olt_inventory")
+
+
+def inventory_download(snapshot):
+    workbook = inventory_workbook(snapshot)
+    provider_name = slugify(snapshot.provider_name) or f"provedor-{snapshot.provider_id}"
+    date = timezone.localdate(snapshot.run.finished_at)
+    return FileResponse(
+        workbook, as_attachment=True, filename=f"relatorio_{provider_name}_{date:%d-%m-%Y}.xlsx",
+        content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Cache-Control": "private, no-store"},
+    )
 
 
 @operator

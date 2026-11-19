@@ -1,15 +1,24 @@
 from contextlib import contextmanager
+from datetime import UTC, datetime
 from io import BytesIO
 from unittest.mock import Mock, patch
+from xml.etree import ElementTree
 from zipfile import ZipFile
 
 from django.contrib.auth import get_user_model
-from django.test import SimpleTestCase, TestCase
+from django.test import Client, SimpleTestCase, TestCase, override_settings
 from django.urls import reverse
 
+from inventory.management.commands.inventory_worker import Command
+from inventory.models import InventoryRun, ProviderSnapshot
+from inventory.services import collect_inventory, enqueue_inventory
+
 from .adapters import AdapterError, HuaweiAdapter, HuaweiTelnetAdapter, TelnetTerminal
+from .inventory_xlsx import inventory_workbook
 from .models import CTO, OLT, ONU, Provider, ProvisioningProfile, Vlan
-from .olt_inventory import parse_mac_table, parse_ont_configuration, parse_service_ports, provider_targets
+from .olt_inventory import (
+    InventoryRow, ONTConfiguration, VLANResult, parse_mac_table, parse_ont_configuration, parse_service_ports, provider_targets,
+)
 
 
 SERVICE_PORTS = """
@@ -105,6 +114,8 @@ class InventoryParserTest(SimpleTestCase):
 
 
 class InventoryReportTest(TestCase):
+    databases = {"default", "inventory"}
+
     def setUp(self):
         self.provider = Provider.objects.create(name="{=1+1}")
         self.vlan = Vlan.objects.create(number=1141, provider=self.provider)
@@ -138,32 +149,65 @@ class InventoryReportTest(TestCase):
         )
         self.assertEqual(provider_targets(self.provider), [(self.olt, [1141, 1143]), (self.second_olt, [1141])])
 
-    def test_requires_operator_and_post_to_open_ssh(self):
+    def test_inventory_requires_operator_and_download_does_not_open_ssh(self):
         with patch.object(HuaweiAdapter, "session") as ssh:
             self.assertEqual(self.client.get(self.url).status_code, 302)
             user = get_user_model().objects.create_user("consulta")
             self.client.force_login(user)
             self.assertEqual(self.client.post(self.url, {"provider": self.provider.pk}).status_code, 403)
             self.client.force_login(self.user)
-            self.assertContains(self.client.get(self.url), "Consultar e baixar XLSX")
+            self.assertContains(self.client.get(self.url), "Baixar último XLSX")
+            self.assertContains(self.client.post(self.url, {"provider": self.provider.pk}), "Ainda não há uma coleta")
             self.assertContains(self.client.get(reverse("reports")), self.url)
             ssh.assert_not_called()
 
-    def test_exports_scoped_onts_and_reports_partial_failure(self):
+    @override_settings(TIME_ZONE="America/Recife")
+    def test_download_filename_uses_provider_name_and_local_capture_date(self):
+        self.client.force_login(self.user)
+        run = InventoryRun.objects.create(status=InventoryRun.Status.COMPLETE, finished_at=datetime(2026, 11, 20, 2, 30, tzinfo=UTC))
+        snapshot = ProviderSnapshot.objects.create(
+            run=run, provider_id=self.provider.pk, provider_name=self.provider.name,
+            ont_count=1, vlan_count=1, failed_vlans=0, partial_vlans=0,
+        )
+        for name, filename_name in [("Attive", "attive"), ("São José Fibra", "sao-jose-fibra"), ("!!!", f"provedor-{self.provider.pk}")]:
+            with self.subTest(provider=name):
+                ProviderSnapshot.objects.filter(pk=snapshot.pk).update(provider_name=name)
+                with patch("network.views.inventory_workbook", return_value=BytesIO()):
+                    response = self.client.post(self.url, {"provider": self.provider.pk})
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(
+                    response["Content-Disposition"], f'attachment; filename="relatorio_{filename_name}_19-11-2026.xlsx"',
+                )
+                self.assertEqual(b"".join(response.streaming_content), b"")
+
+    def test_exports_saved_scoped_onts_and_reports_partial_failure(self):
         sessions = []
 
         @contextmanager
         def session(adapter, olt, *, read_only):
             sessions.append((olt.pk, read_only))
-            if olt == self.second_olt:
+            if olt != self.olt:
                 raise AdapterError("Sem conexão com a OLT.")
             yield object()
 
-        self.client.force_login(self.user)
         with patch.object(HuaweiAdapter, "session", session), patch.object(HuaweiAdapter, "command", side_effect=[
             "", "", SERVICE_PORTS, MAC_TABLE, ONT_CONFIGURATION,
         ]) as commands:
-            response = self.client.post(self.url, {"provider": self.provider.pk})
+            run = enqueue_inventory(requested_by=self.user.username)
+            collect_inventory(run)
+        self.assertEqual(run.status, InventoryRun.Status.PARTIAL)
+        external = OLT.objects.get(name="OLT externa")
+        self.assertCountEqual(sessions, [(self.olt.pk, True), (self.second_olt.pk, True), (external.pk, True)])
+        self.assertEqual([call.args[1] for call in commands.call_args_list], [
+            "enable", "config", "display service-port vlan 1141", "display mac-address vlan 1141",
+            "display current-configuration ont 0/1/1 7",
+        ])
+        self.client.force_login(self.user)
+        snapshot = run.providers.get(provider_id=self.provider.pk)
+        self.assertEqual((snapshot.ont_count, snapshot.failed_vlans), (1, 1))
+        self.assertContains(self.client.post(self.url, {"provider": self.provider.pk}), "Ainda não há uma coleta")
+        with patch.object(HuaweiAdapter, "session") as session_mock:
+            response = self.client.get(reverse("inventory_history_download", args=[snapshot.pk]))
             self.assertEqual(response.status_code, 200)
             self.assertIn(".xlsx", response["Content-Disposition"])
             with ZipFile(BytesIO(b"".join(response.streaming_content))) as xlsx:
@@ -175,8 +219,80 @@ class InventoryReportTest(TestCase):
                 self.assertNotIn("00:11:22:33:44:77", shared)
                 self.assertIn("Sem conexão com a OLT.", shared)
                 self.assertNotIn("<f", xlsx.read("xl/worksheets/sheet1.xml").decode())
-        self.assertEqual(sessions, [(self.olt.pk, True), (self.second_olt.pk, True)])
-        self.assertEqual([call.args[1] for call in commands.call_args_list], [
-            "enable", "config", "display service-port vlan 1141", "display mac-address vlan 1141",
-            "display current-configuration ont 0/1/1 7",
+            session_mock.assert_not_called()
+
+    def test_latest_complete_snapshot_is_kept_after_a_failed_run_and_shown_on_dashboard(self):
+        self.client.force_login(self.user)
+        ONU.objects.filter(provider=self.provider).update(status=ONU.Status.ACTIVE)
+        for captured_at, count, failed in [(19, 12, 0), (20, 3, 1)]:
+            run = InventoryRun.objects.create(
+                status=InventoryRun.Status.PARTIAL if failed else InventoryRun.Status.COMPLETE,
+                finished_at=datetime(2026, 11, captured_at, 12, tzinfo=UTC),
+            )
+            ProviderSnapshot.objects.create(
+                run=run, provider_id=self.provider.pk, provider_name=self.provider.name,
+                ont_count=count, vlan_count=2, failed_vlans=failed, partial_vlans=0,
+            )
+        response = self.client.post(self.url, {"provider": self.provider.pk})
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("_19-11-2026.xlsx", response["Content-Disposition"])
+        self.assertTrue(b"".join(response.streaming_content).startswith(b"PK"))
+        page = self.client.get(reverse("dashboard"))
+        provider = next(item for item in page.context["providers"] if item.pk == self.provider.pk)
+        self.assertEqual((provider.onu_count, provider.provisioned_count, provider.inventory.ont_count), (1, 1, 12))
+
+    def test_collector_groups_providers_by_olt_and_deduplicates_onts_across_vlans(self):
+        second_vlan = Vlan.objects.create(number=1143, provider=self.provider)
+        ProvisioningProfile.objects.filter(name="Perfil duplicado").update(vlan=second_vlan)
+        ProvisioningProfile.objects.filter(name="Perfil externo").update(olt=self.olt)
+        row = InventoryRow((0, 1, 1, 7), (1454,), ONTConfiguration(), ())
+        run = enqueue_inventory()
+        with patch("inventory.services.query_olt", side_effect=lambda olt, vlans: [
+            VLANResult(vlan, "Concluída", rows=[row]) for vlan in vlans
+        ]) as query:
+            collect_inventory(run)
+        self.assertCountEqual([call.args for call in query.call_args_list], [
+            (self.olt, [1141, 1142, 1143]), (self.second_olt, [1141]),
         ])
+        snapshot = run.providers.get(provider_id=self.provider.pk)
+        self.assertEqual((snapshot.ont_count, snapshot.vlan_count), (2, 3))
+        namespaces = {"x": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
+        with ZipFile(inventory_workbook(snapshot)) as xlsx:
+            sheet = ElementTree.fromstring(xlsx.read("xl/worksheets/sheet2.xml"))
+            total_row = sheet.findall("x:sheetData/x:row", namespaces)[-1]
+            label_id = int(total_row.findtext("x:c[@r='A6']/x:v", namespaces=namespaces))
+            shared = ElementTree.fromstring(xlsx.read("xl/sharedStrings.xml")).findall("x:si", namespaces)
+            self.assertEqual("".join(shared[label_id].itertext()), "Total")
+            self.assertEqual(total_row.findtext("x:c[@r='E6']/x:v", namespaces=namespaces), "2")
+            self.assertEqual(sheet.find("x:autoFilter", namespaces).get("ref"), "A1:G4")
+
+    def test_manual_collection_is_post_only_with_csrf_and_queues_once(self):
+        url = reverse("inventory_collect")
+        self.client.force_login(self.user)
+        self.assertEqual(self.client.get(url).status_code, 405)
+        protected = Client(enforce_csrf_checks=True)
+        protected.force_login(self.user)
+        self.assertEqual(protected.post(url).status_code, 403)
+        with patch("inventory.services.query_olt") as query:
+            self.assertRedirects(self.client.post(url), self.url)
+            self.assertRedirects(self.client.post(url), self.url)
+            query.assert_not_called()
+        run = InventoryRun.objects.get()
+        self.assertEqual((run.status, run.requested_by), (InventoryRun.Status.QUEUED, self.user.username))
+
+    @override_settings(TIME_ZONE="America/Recife")
+    @patch("inventory.management.commands.inventory_worker.timezone.now")
+    def test_worker_schedules_once_per_local_day_after_three(self, now):
+        with patch("inventory.services.query_olt", side_effect=lambda olt, vlans: [
+            VLANResult(vlan, "Sem ONTs") for vlan in vlans
+        ]) as query:
+            now.return_value = datetime(2026, 11, 19, 5, 59, tzinfo=UTC)
+            Command().process_queue()
+            self.assertFalse(InventoryRun.objects.exists())
+            now.return_value = datetime(2026, 11, 19, 6, 0, tzinfo=UTC)
+            Command().process_queue()
+            Command().process_queue()
+            self.assertEqual(query.call_count, 3)
+        run = InventoryRun.objects.get()
+        self.assertEqual(run.status, InventoryRun.Status.COMPLETE)
+        self.assertEqual(str(run.scheduled_day), "2026-11-19")

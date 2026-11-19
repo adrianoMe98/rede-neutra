@@ -1,6 +1,6 @@
 # Rede Neutra
 
-ERP web para cadastro e provisionamento de ONTs/ONUs em uma rede neutra. Interface em português, Django 5.2, SQLite persistente e Docker. Primeira versão funcional; a integração com equipamentos físicos ainda precisa ser homologada em laboratório.
+ERP web para cadastro e provisionamento de ONTs/ONUs em uma rede neutra. Interface em português, Django 5.2 e Docker, com cadastros em SQLite e histórico de inventário em PostgreSQL.
 
 ## O que funciona
 
@@ -15,12 +15,12 @@ ERP web para cadastro e provisionamento de ONTs/ONUs em uma rede neutra. Interfa
 - Perfis de provisionamento por provedor/OLT com VLAN de serviço, VLAN do cliente, line profile, service profile e GEM port. Os parâmetros são copiados para o cadastro da ONU e preservados após edições do perfil.
 - Consulta pontual de TX/RX **na ONU**, em dBm, com data da leitura. O estado “Provisionada” indica sucesso do cadastro na integração, e não monitoração online/offline.
 - Relatórios com filtros por descrição/serial, provedor, situação, VLAN, CTO e OLT, e exportação CSV compatível com Excel. Leituras simuladas são identificadas na tela e no CSV.
-- Inventário por provedor nas OLTs Huawei com exportação XLSX da descrição, serial GPON e endereços MAC disponíveis.
+- Coleta diária e manual do inventário das OLTs Huawei, com histórico em PostgreSQL, contagem por provedor no painel e exportação XLSX.
 - Simulação de todo o fluxo sem conexão com equipamentos; adaptadores separados por fabricante.
 
 ## Iniciar com Docker
 
-Pré-requisitos: Docker Engine com Compose v2 e Python 3.12 para gerar a configuração inicial. Não há credenciais padrão nem banco demonstrativo carregado automaticamente.
+Use Docker Engine com Compose 2.33.1 ou posterior e Python 3.12 para gerar a configuração inicial.
 
 ```sh
 cd /workspace/rede-neutra
@@ -33,7 +33,9 @@ docker compose exec web python manage.py createsuperuser
 
 A aplicação escuta na porta **8000**, publicada somente na interface local da máquina. O container executa migrações e coleta os arquivos estáticos antes de iniciar o Gunicorn como usuário sem privilégios. O healthcheck verifica `/health/` e o acesso ao banco. Ajuste `ERP_PORT` se a porta já estiver ocupada.
 
-Dados ficam no volume `erp_data`. `docker compose down` preserva esse volume; `down -v` o apaga. Não use múltiplas réplicas com esta configuração SQLite. Para uma operação maior, a próxima etapa é PostgreSQL e uma fila de provisionamento.
+Os cadastros ficam no volume `erp_data` e o histórico de inventário no volume `inventory_data`. O Compose conecta o PostgreSQL ao ERP por uma rede privada. Inclua os dois volumes e o `.env` no backup da aplicação.
+
+Em uma instalação existente, rode novamente `scripts/init_env.py` antes de `docker compose up -d --build`. O script preenche a senha de inventário e conserva os valores já salvos.
 
 Se o build Docker não consegue resolver os registries, mas o host tem acesso ao PyPI, use o build sem rede abaixo em um host Linux com Python 3.12 e a mesma arquitetura da imagem. O download mantém TLS e a verificação de integridade do PyPI; o build instala os mesmos pacotes fixados sem consultar a rede. Os wheels são locais e não entram no Git.
 
@@ -61,13 +63,14 @@ python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 .venv/bin/python scripts/init_env.py
 .venv/bin/python manage.py migrate --noinput
+.venv/bin/python manage.py migrate --database inventory --noinput
 .venv/bin/python manage.py collectstatic --noinput
 .venv/bin/python manage.py createsuperuser
 .venv/bin/python manage.py seed_demo  # opcional, somente base vazia
 .venv/bin/gunicorn config.wsgi:application --bind 0.0.0.0:8000 --workers 2 --threads 4 --timeout 180
 ```
 
-`init_env.py` gera `.env` com permissões restritas e chaves exclusivas. Se o arquivo já existe, inclusive uma cópia de `.env.example`, preenche somente chaves ausentes ou vazias; chaves preenchidas e demais configurações são preservadas. `.env`, bancos e credenciais não são versionados. Guarde `DJANGO_SECRET_KEY`, `OLT_CREDENTIAL_KEY` e backups do banco em local seguro; perder a chave de criptografia torna as senhas de OLT armazenadas ilegíveis.
+`init_env.py` gera chaves exclusivas e preenche os campos ausentes ou vazios do `.env`. Guarde `DJANGO_SECRET_KEY`, `OLT_CREDENTIAL_KEY`, `INVENTORY_DB_PASSWORD` e os backups em local seguro. Em desenvolvimento, o banco de inventário local usa SQLite. Para rodar o coletor fora do Docker, configure `INVENTORY_DB_HOST`, `INVENTORY_DB_PASSWORD` e, se necessário, `INVENTORY_DB_NAME`, `INVENTORY_DB_USER` e `INVENTORY_DB_PORT`, aplique a migração desse banco e execute `python manage.py inventory_worker`.
 
 Em cada tarefa na nuvem use o checkout existente: o ambiente já é isolado, não é necessário criar worktrees.
 
@@ -95,9 +98,11 @@ A tela informa a quantidade retornada pela OLT, a quantidade disponível para co
 
 ### Consultar ONTs provisionadas por provedor
 
-Em **Relatórios → Inventário de ONTs por VLAN**, selecione o provedor e baixe o XLSX. O módulo usa as OLTs e VLANs de serviço vinculadas por um perfil de provisionamento ou por um cadastro de ONU. Em cada VLAN, consulta os service-ports, a tabela MAC e a configuração de cada posição PON/ONT.
+Em **Relatórios → Inventário de ONTs por VLAN**, selecione o provedor e clique em **Baixar último XLSX**. O arquivo usa a última coleta em que todas as VLANs daquele provedor foram lidas. O nome e a aba **Consultas** indicam a data da coleta. O histórico oferece os arquivos anteriores e identifica as tentativas parciais e as falhas.
 
-O XLSX identifica o serial GPON de `sn-auth`, o MAC de autenticação de `mac-auth`, quando configurado, e os MACs associados aos service-ports na tabela da OLT. Esses últimos podem pertencer a equipamentos conectados à ONT. A aba **Consultas** indica quais OLTs e VLANs retornaram dados, ficaram sem ONTs ou apresentaram erro. A busca usa SSH ou Telnet somente para consulta e está disponível aos operadores.
+O coletor executa diariamente a partir das **03h no horário de Recife**. Operadores podem solicitar uma execução em **Coletar agora** e acompanhar o resultado no histórico. Cada execução reúne as VLANs vinculadas por perfis ou cadastros de ONU, consulta cada OLT Huawei por SSH ou Telnet e grava os resultados em PostgreSQL. O XLSX é gerado a partir dos dados armazenados.
+
+O XLSX identifica o serial GPON de `sn-auth`, o MAC de autenticação de `mac-auth`, quando configurado, e os MACs associados aos service-ports, que podem pertencer a equipamentos conectados à ONT. No painel **Visão geral**, a contagem do inventário considera uma vez cada posição PON/ONT por OLT, mesmo quando ela aparece em várias VLANs do mesmo provedor. A coluna de provisionamento no ERP usa o estado dos cadastros locais.
 
 ### Testar a comunicação com a OLT
 

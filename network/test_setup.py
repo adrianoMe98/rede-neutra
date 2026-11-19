@@ -19,8 +19,9 @@ class EnvironmentSetupTest(SimpleTestCase):
             path.write_text((settings.BASE_DIR / ".env.example").read_text())
             generated = initialize_env(path)
             values = dotenv_values(path)
-            self.assertEqual(set(generated), {"DJANGO_SECRET_KEY", "OLT_CREDENTIAL_KEY"})
+            self.assertEqual(set(generated), {"DJANGO_SECRET_KEY", "OLT_CREDENTIAL_KEY", "INVENTORY_DB_PASSWORD"})
             self.assertGreaterEqual(len(values["DJANGO_SECRET_KEY"]), 64)
+            self.assertGreaterEqual(len(values["INVENTORY_DB_PASSWORD"]), 48)
             Fernet(values["OLT_CREDENTIAL_KEY"].encode())
             self.assertEqual(values["DJANGO_DEBUG"], "0")
             self.assertEqual(values["ENABLE_LIVE_OLT"], "0")
@@ -29,10 +30,14 @@ class EnvironmentSetupTest(SimpleTestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / ".env"
             existing_key = Fernet.generate_key().decode()
-            path.write_text(f"# Configuração personalizada\nDJANGO_SECRET_KEY=\nOLT_CREDENTIAL_KEY={existing_key}\nDJANGO_ALLOWED_HOSTS=erp.example\n")
+            path.write_text(
+                f"# Configuração personalizada\nDJANGO_SECRET_KEY=\nOLT_CREDENTIAL_KEY={existing_key}\n"
+                "INVENTORY_DB_PASSWORD=senha-de-teste\nDJANGO_ALLOWED_HOSTS=erp.example\n"
+            )
             self.assertEqual(initialize_env(path), ["DJANGO_SECRET_KEY"])
             values = dotenv_values(path)
             self.assertEqual(values["OLT_CREDENTIAL_KEY"], existing_key)
+            self.assertEqual(values["INVENTORY_DB_PASSWORD"], "senha-de-teste")
             self.assertEqual(values["DJANGO_ALLOWED_HOSTS"], "erp.example")
             self.assertIn("# Configuração personalizada", path.read_text())
 
@@ -51,7 +56,7 @@ class EnvironmentSetupTest(SimpleTestCase):
             with self.subTest(content=content), tempfile.TemporaryDirectory() as directory:
                 path = Path(directory) / ".env"
                 path.write_text(content)
-                self.assertEqual(len(initialize_env(path)), 2)
+                self.assertEqual(len(initialize_env(path)), 3)
                 self.assertTrue(dotenv_values(path)["DJANGO_SECRET_KEY"])
 
     def test_empty_key_fails_at_startup_with_actionable_error(self):

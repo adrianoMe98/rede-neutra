@@ -1,13 +1,22 @@
 services:
   web:
     build: .
+    image: rede-neutra-web
     init: true
     env_file: .env
-    environment:
+    environment: &erp-environment
       DATA_DIR: /app/data
+      INVENTORY_DB_HOST: inventory-db
+      INVENTORY_DB_NAME: rede_neutra_inventory
+      INVENTORY_DB_USER: erp_inventory
+    depends_on:
+      inventory-db:
+        condition: service_healthy
     networks:
       containers:
         ipv4_address: "${ENDERECO_IP:?Defina ENDERECO_IP no .env}"
+        gw_priority: 1
+      inventory:
     ports:
       - "${ERP_PORT:-8000}:8000"
     volumes:
@@ -24,8 +33,47 @@ services:
     cap_drop:
       - ALL
 
+  inventory-worker:
+    image: rede-neutra-web
+    init: true
+    env_file: .env
+    environment: *erp-environment
+    command: ["python", "manage.py", "inventory_worker"]
+    network_mode: "service:web"
+    depends_on:
+      web:
+        condition: service_healthy
+        restart: true
+    volumes:
+      - erp_data:/app/data
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+  inventory-db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: rede_neutra_inventory
+      POSTGRES_USER: erp_inventory
+      POSTGRES_PASSWORD: "${INVENTORY_DB_PASSWORD:?Execute scripts/init_env.py para gerar INVENTORY_DB_PASSWORD}"
+    networks:
+      - inventory
+    volumes:
+      - inventory_data:/var/lib/postgresql/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
 volumes:
   erp_data:
+  inventory_data:
 networks:
-  containers: 
+  containers:
     external: true
+  inventory:
+    internal: true
