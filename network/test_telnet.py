@@ -1,7 +1,7 @@
 from socketserver import StreamRequestHandler, TCPServer
 from threading import Thread
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from django.contrib.auth import get_user_model
 from django.test import SimpleTestCase, TestCase, override_settings
@@ -24,7 +24,7 @@ class HuaweiTelnetTest(SimpleTestCase):
     def test_discovery_through_telnet_negotiation_and_login(self):
         received = []
         replies = (
-            b"Password: ",
+            b">>User password:",
             b"\r\nOLT-TESTE>",
             b"VERSION : MA5600V800R017C10\r\nOLT-TESTE>",
             b"\r\nOLT-TESTE#",
@@ -36,7 +36,7 @@ class HuaweiTelnetTest(SimpleTestCase):
             timeout = 3
 
             def handle(self):
-                self.wfile.write(b"\xff\xfb\x01\r\nUser name: ")
+                self.wfile.write(b"\xff\xfb\x01\r\nWarning: Telnet is not a secure protocol.\r\n\r\n>>User name:")
                 for reply in replies:
                     line = self.rfile.readline()
                     received.append(line)
@@ -60,13 +60,52 @@ class HuaweiTelnetTest(SimpleTestCase):
     @patch("network.adapters.TelnetConnection")
     def test_login_rejection_is_redacted_and_connection_closed(self, telnet):
         conn = telnet.return_value
-        conn.read_some.side_effect = [b"User ", b"name: ", b"Password: ", b"\r\nInvalid password\r\nUser name:"]
+        conn.read_some.side_effect = [b"User ", b"name: ", b"Password: ", b"\r\nInvalid password\r\n"]
         with self.assertRaises(AdapterError) as error:
             self.adapter.test_connection(self.olt)
         self.assertEqual(error.exception.code, "authentication")
         self.assertNotIn("senha-teste", str(error.exception))
         self.assertEqual([call.args[0] for call in conn.write.call_args_list], [b"olt-teste\r\n", b"senha-teste\r\n"])
+        telnet.assert_called_once()
         conn.close.assert_called_once()
+
+    @patch("network.adapters.TelnetConnection")
+    def test_read_only_session_reconnects_once_after_a_login_timeout(self, telnet):
+        first, second = Mock(), Mock()
+        telnet.side_effect = [first, second]
+        first.read_some.side_effect = TimeoutError()
+        second.read_some.side_effect = [
+            b">>User name:", b">>User password:", b"\r\nOLT-TESTE>",
+            b"VERSION : MA5600V800R017C10\r\nOLT-TESTE>",
+        ]
+        second.connect.side_effect = lambda: first.close.assert_called_once()
+        self.assertIn("Comunicação Telnet confirmada", self.adapter.test_connection(self.olt))
+        self.assertEqual(telnet.call_count, 2)
+        first.write.assert_not_called()
+        second.close.assert_called_once()
+
+    @patch("network.adapters.TelnetConnection")
+    def test_read_only_session_reports_the_prompt_if_both_attempts_time_out(self, telnet):
+        conn = telnet.return_value
+        conn.read_some.side_effect = [
+            b"User name: ", b"Password: ", TimeoutError(),
+            b"User name: ", b"Password: ", TimeoutError(),
+        ]
+        with self.assertRaisesMessage(AdapterError, "aguardando o prompt da CLI após o envio da senha") as error:
+            self.adapter.test_connection(self.olt)
+        self.assertEqual(error.exception.code, "authentication")
+        self.assertEqual(telnet.call_count, 2)
+        self.assertEqual(conn.close.call_count, 2)
+
+    @override_settings(ENABLE_LIVE_OLT=True)
+    @patch("network.adapters.TelnetConnection")
+    def test_write_session_does_not_reconnect_after_login_timeout(self, telnet):
+        telnet.return_value.read_some.side_effect = TimeoutError()
+        with self.assertRaisesMessage(AdapterError, "aguardando o prompt inicial"):
+            with self.adapter.session(self.olt):
+                self.fail("A sessão de escrita exige autenticação.")
+        telnet.assert_called_once()
+        telnet.return_value.close.assert_called_once()
 
     @patch("network.adapters.TelnetConnection")
     def test_firmware_and_provision_gate(self, telnet):

@@ -105,17 +105,25 @@ def catalog_edit(request, kind, pk=None):
     model, form_class, title, singular = CATALOGS[kind]
     obj = get_object_or_404(model, pk=pk) if pk else None
     form = form_class(request.POST or None, instance=obj)
-    if request.method == "POST" and form.is_valid():
+    if request.method == "POST":
         try:
-            form.save()
-            messages.success(request, f"Cadastro de {singular} salvo.")
-            return redirect("catalog", kind=kind)
+            with transaction.atomic():
+                saved = form.is_valid()
+                if saved:
+                    form.save()
         except IntegrityError:
             form.add_error(None, "Este cadastro já existe ou conflita com outro registro.")
+        except OperationalError as exc:
+            if not getattr(exc.__cause__, "sqlite_errorname", "").startswith(("SQLITE_BUSY", "SQLITE_LOCKED")):
+                raise
+            form.add_error(None, "Há outro cadastro em andamento. Confira os dados e tente salvar novamente.")
+        else:
+            if saved:
+                messages.success(request, f"Cadastro de {singular} salvo.")
+                return redirect("catalog", kind=kind)
     return render(request, "network/form.html", {"form": form, "title": f"{'Editar' if pk else 'Cadastrar'} {singular}",
                                                  "page": kind, "kind": kind, "back_url": f"/cadastros/{kind}/",
-                                                 "olt_for_test": obj if kind == "olts" else None,
-                                                 "vlans_data": list(Vlan.objects.values("id", "provider_id"))})
+                                                 "olt_for_test": obj if kind == "olts" else None})
 
 
 @operator
@@ -163,7 +171,13 @@ def vlan_range_remove(request):
     form = VlanIntervalForm(request.POST if request.method == "POST" else None)
     vlans, confirmation = None, ""
     if request.method == "POST" and form.is_valid():
-        targets = form.vlan_range().filter(provider=form.cleaned_data["provider"])
+        targets = form.vlan_range().filter(provider=form.cleaned_data["provider"]).annotate(
+            has_onu=Exists(ONU.objects.filter(vlan_id=OuterRef("pk"))),
+            has_profile=Exists(ProvisioningProfile.objects.filter(
+                Q(vlan_id=OuterRef("pk"))
+                | Q(vlan__isnull=True, provider_id=OuterRef("provider_id"), vlan_description=OuterRef("name")),
+            )),
+        )
         if request.POST.get("action") == "remove":
             try:
                 reviewed = signing.loads(request.POST.get("confirmation", ""), salt=VLAN_REMOVAL_SALT)
@@ -171,6 +185,8 @@ def vlan_range_remove(request):
                     locked = list(targets.select_for_update())
                     if not locked or reviewed != vlan_removal_selection(request.user, form, locked):
                         raise ValidationError("A seleção mudou. Confira a nova prévia antes de remover.")
+                    if any(vlan.has_onu or vlan.has_profile for vlan in locked):
+                        raise ValidationError("Há VLANs da faixa vinculadas a ONUs ou perfis de provisionamento.")
                     for ids in batched((vlan.pk for vlan in locked), 500):
                         targets.filter(pk__in=ids).delete()
             except signing.BadSignature:
@@ -189,10 +205,7 @@ def vlan_range_remove(request):
                 count = len(locked)
                 messages.success(request, f"{count} {'VLAN removida' if count == 1 else 'VLANs removidas'} do ERP.")
                 return redirect("catalog", kind="vlans")
-        vlans = list(targets.annotate(
-            has_onu=Exists(ONU.objects.filter(vlan_id=OuterRef("pk"))),
-            has_profile=Exists(ProvisioningProfile.objects.filter(vlan_id=OuterRef("pk"))),
-        ))
+        vlans = list(targets)
         if vlans and not any(vlan.has_onu or vlan.has_profile for vlan in vlans):
             selection = vlan_removal_selection(request.user, form, vlans)
             confirmation = signing.dumps(selection, salt=VLAN_REMOVAL_SALT, compress=True)
@@ -286,8 +299,10 @@ def onu_edit(request, pk=None):
             form.add_error(None, "O cadastro mudou ou a porta / ONT ID / service-port já está em uso. Confira os dados.")
     return render(request, "network/form.html", {"form": form, "title": "Editar ONU" if pk else "Cadastrar ONU",
         "page": "onus", "kind": "onu", "back_url": "/onus/", "discovered": discovered,
-        "vlans_data": list(Vlan.objects.values("id", "provider_id")),
-        "profiles_data": list(ProvisioningProfile.objects.filter(active=True).values("id", "provider_id", "vlan_id", "olt_id", "line_profile", "service_profile", "gem_port", "user_vlan"))})
+        "vlans_data": list(Vlan.objects.values("id", "provider_id", "number", "name")),
+        "profiles_data": list(form.fields["profile"].queryset.values(
+            "id", "provider_id", "vlan_id", "vlan_description", "olt_id", "line_profile", "service_profile", "gem_port", "user_vlan",
+        ))})
 
 
 @operator

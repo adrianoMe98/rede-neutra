@@ -38,6 +38,16 @@ class Vlan(models.Model):
             raise ValidationError("Não é possível trocar o provedor de uma VLAN em uso por outro provedor.")
         if self.pk and self.provisioning_profiles.exclude(provider_id=self.provider_id).exists():
             raise ValidationError("Esta VLAN está vinculada a perfis de outro provedor.")
+        if self.pk:
+            original = type(self).objects.get(pk=self.pk)
+            if (
+                original.name
+                and (self.provider_id, self.name, self.number) != (original.provider_id, original.name, original.number)
+                and ProvisioningProfile.objects.filter(
+                    provider_id=original.provider_id, vlan_description=original.name,
+                ).exists()
+            ):
+                raise ValidationError("Esta VLAN faz parte de um grupo de serviço usado por um perfil.")
 
     def __str__(self):
         return f"{self.number} · {self.provider.name}"
@@ -184,10 +194,16 @@ class ONU(models.Model):
             profile = self.profile
             if not profile.active:
                 errors["profile"] = "O perfil selecionado está inativo."
-            if (self.provider_id, self.vlan_id, self.olt_id) != (profile.provider_id, profile.vlan_id, profile.olt_id):
+            if (
+                (self.provider_id, self.olt_id) != (profile.provider_id, profile.olt_id)
+                or (self.vlan_id and not profile.accepts_vlan(self.vlan))
+            ):
                 errors["profile"] = "Provedor, VLAN e OLT devem corresponder ao perfil selecionado."
-            if not self.profile_snapshot or self.profile_snapshot.get("profile_id") != profile.pk:
-                self.profile_snapshot = profile.parameters()
+            elif self.vlan_id:
+                if self.profile_snapshot.get("profile_id") != profile.pk:
+                    self.profile_snapshot = profile.parameters(self.vlan)
+                elif self.profile_snapshot.get("user_vlan_follows_service"):
+                    self.profile_snapshot["user_vlan"] = self.vlan.number
         else:
             self.profile_snapshot = {}
         if errors:
@@ -201,7 +217,9 @@ class ProvisioningProfile(models.Model):
     name = models.CharField("nome do perfil", max_length=100, unique=True)
     provider = models.ForeignKey(Provider, on_delete=models.PROTECT, verbose_name="provedor", related_name="provisioning_profiles")
     olt = models.ForeignKey(OLT, on_delete=models.PROTECT, verbose_name="OLT", related_name="provisioning_profiles")
-    vlan = models.ForeignKey(Vlan, on_delete=models.PROTECT, verbose_name="VLAN de serviço", related_name="provisioning_profiles")
+    vlan = models.ForeignKey(Vlan, null=True, blank=True, on_delete=models.PROTECT,
+                             verbose_name="VLAN de serviço", related_name="provisioning_profiles")
+    vlan_description = models.CharField("grupo de VLANs de serviço", max_length=120, blank=True)
     line_profile = models.PositiveIntegerField("ID do line profile", validators=bounded(1, 4095))
     service_profile = models.PositiveIntegerField("ID do service profile", validators=bounded(1, 4095))
     gem_port = models.PositiveIntegerField("GEM port", default=1, validators=bounded(0, 4095))
@@ -213,19 +231,41 @@ class ProvisioningProfile(models.Model):
     class Meta:
         ordering = ["name"]
         verbose_name = "perfil de provisionamento"
+        constraints = [
+            models.CheckConstraint(
+                condition=(
+                    models.Q(vlan__isnull=False, vlan_description="")
+                    | (models.Q(vlan__isnull=True) & ~models.Q(vlan_description=""))
+                ),
+                name="profile_has_one_service_vlan_selection",
+            ),
+        ]
 
     def clean(self):
+        if bool(self.vlan_id) == bool(self.vlan_description):
+            raise ValidationError({"vlan": "Selecione uma VLAN de serviço ou um grupo por descrição."})
         if self.vlan_id and self.provider_id and self.vlan.provider_id != self.provider_id:
             raise ValidationError({"vlan": "A VLAN de serviço precisa pertencer ao provedor do perfil."})
+        if self.vlan_description and not Vlan.objects.filter(provider_id=self.provider_id, name=self.vlan_description).exists():
+            raise ValidationError({"vlan": "O grupo de VLANs deve pertencer ao provedor do perfil."})
         if self.pk and self.onus.exists():
             original = type(self).objects.get(pk=self.pk)
-            if any(getattr(self, name) != getattr(original, name) for name in ("provider_id", "vlan_id", "olt_id")):
+            fields = ("provider_id", "vlan_id", "vlan_description", "olt_id")
+            if any(getattr(self, name) != getattr(original, name) for name in fields):
                 raise ValidationError("Um perfil em uso não pode trocar de provedor, VLAN ou OLT. Crie outro perfil.")
 
-    def parameters(self):
-        return {"profile_id": self.pk, "name": self.name, "line_profile": self.line_profile,
-                "service_profile": self.service_profile, "gem_port": self.gem_port,
-                "user_vlan": self.user_vlan if self.user_vlan is not None else self.vlan.number}
+    def accepts_vlan(self, vlan):
+        if self.vlan_description:
+            return (vlan.provider_id, vlan.name) == (self.provider_id, self.vlan_description)
+        return vlan.pk == self.vlan_id
+
+    def parameters(self, vlan=None):
+        user_vlan = self.user_vlan if self.user_vlan is not None else (vlan or self.vlan).number
+        parameters = {"profile_id": self.pk, "name": self.name, "line_profile": self.line_profile,
+                      "service_profile": self.service_profile, "gem_port": self.gem_port, "user_vlan": user_vlan}
+        if self.vlan_description and self.user_vlan is None:
+            parameters["user_vlan_follows_service"] = True
+        return parameters
 
     def __str__(self):
         return self.name

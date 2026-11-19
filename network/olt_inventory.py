@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 import paramiko
 
 from .adapters import AdapterError, HuaweiAdapter, get_adapter
-from .models import OLT, ONU, ProvisioningProfile
+from .models import OLT, ONU, ProvisioningProfile, Vlan
 
 
 TOTAL = re.compile(r"^\s*Total\s*:\s*(\d+)\b", re.I | re.M)
@@ -52,6 +52,13 @@ def provider_targets(provider):
         pairs = model.objects.filter(provider=provider, vlan__provider=provider).order_by()
         for olt_id, vlan in pairs.values_list("olt_id", "vlan__number").distinct():
             vlan_numbers[olt_id].add(vlan)
+    grouped_profiles = ProvisioningProfile.objects.filter(provider=provider, vlan__isnull=True).order_by()
+    numbers_by_description = defaultdict(set)
+    for description, number in Vlan.objects.filter(provider=provider).exclude(name="").values_list("name", "number"):
+        numbers_by_description[description].add(number)
+    for olt_id, description in grouped_profiles.values_list("olt_id", "vlan_description").distinct():
+        if description in numbers_by_description:
+            vlan_numbers[olt_id].update(numbers_by_description[description])
     return [(olt, sorted(vlan_numbers[olt.pk])) for olt in OLT.objects.filter(pk__in=vlan_numbers)]
 
 

@@ -1,3 +1,5 @@
+from collections import Counter
+
 from django import forms
 from django.core.exceptions import ValidationError
 from django.db import transaction
@@ -99,9 +101,59 @@ class OLTForm(forms.ModelForm):
 
 
 class ProvisioningProfileForm(forms.ModelForm):
+    vlan = forms.ChoiceField(
+        label="VLAN de serviço",
+        help_text="Ao selecionar um grupo, o número da VLAN é escolhido no cadastro da ONU.",
+    )
+
     class Meta:
         model = ProvisioningProfile
         fields = ["name", "provider", "olt", "vlan", "line_profile", "service_profile", "gem_port", "user_vlan", "description", "active"]
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        vlans = list(Vlan.objects.select_related("provider"))
+        group_sizes = Counter((vlan.provider_id, vlan.name) for vlan in vlans if vlan.name)
+        current_group = (self.instance.provider_id, self.instance.vlan_description)
+
+        choices = {"": "Selecione uma VLAN ou descrição"}
+        self.vlan_choice_providers = {}
+        self.vlan_groups = {}
+        for vlan in vlans:
+            group = (vlan.provider_id, vlan.name)
+            size = group_sizes[group]
+            grouped = size > 1 or (size and group == current_group)
+            if grouped:
+                value = f"grupo:{vlan.provider_id}:{vlan.name}"
+                unit = "VLAN" if size == 1 else "VLANs"
+                label = f"{vlan.name} · {size} {unit}"
+                choices[value] = label
+                self.vlan_choice_providers[value] = vlan.provider_id
+                self.vlan_groups[value] = group
+            if not grouped or vlan.pk == self.instance.vlan_id:
+                value = str(vlan.pk)
+                choices[value] = f"{vlan.number} · {vlan.name or vlan.provider.name}"
+                self.vlan_choice_providers[value] = vlan.provider_id
+
+        self.fields["vlan"].choices = list(choices.items())
+        if self.instance.vlan_description:
+            self.initial["vlan"] = f"grupo:{self.instance.provider_id}:{self.instance.vlan_description}"
+
+    def clean_vlan(self):
+        selected = self.cleaned_data["vlan"]
+        group = self.vlan_groups.get(selected)
+        if group:
+            provider = self.cleaned_data.get("provider")
+            provider_id, description = group
+            if provider is None or provider.pk != provider_id:
+                raise ValidationError("O grupo de VLANs deve pertencer ao provedor do perfil.")
+            self.instance.vlan_description = description
+            return None
+        self.instance.vlan_description = ""
+        vlan = Vlan.objects.filter(pk=selected).first()
+        if vlan is None:
+            raise ValidationError("A VLAN selecionada não está mais cadastrada.")
+        return vlan
 
 
 class DiscoveryForm(forms.Form):
@@ -122,7 +174,7 @@ class ONUForm(forms.ModelForm):
         if self.instance.profile_id:
             profiles = ProvisioningProfile.objects.filter(Q(active=True) | Q(pk=self.instance.profile_id))
         self.fields["profile"].queryset = profiles.select_related("provider", "vlan", "olt")
-        self.fields["profile"].help_text = "Selecione um perfil para preencher provedor, OLT e VLAN. Sem perfil, usa os parâmetros padrão da OLT."
+        self.fields["profile"].help_text = "O perfil preenche provedor e OLT. Se ele usa um grupo, escolha a VLAN dentro desse grupo."
     class Meta:
         model = ONU
         fields = ["profile", "provider", "subscriber", "serial", "vlan", "cto", "port", "olt", "frame", "slot", "pon", "ont_id", "service_port"]

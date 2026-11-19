@@ -134,6 +134,23 @@ class VlanRangeRemovalTest(TestCase):
         self.assertFalse(response.context["confirmation"])
         self.assertEqual(Vlan.objects.filter(number__range=(first, last)).count(), 501)
 
+    def test_group_link_added_after_preview_protects_vlans(self):
+        Vlan.objects.filter(pk__in=[self.first.pk, self.last.pk]).update(name="Uplink")
+        preview = self.client.post(self.url, self.payload)
+        ProvisioningProfile.objects.create(
+            name="Perfil Uplink", provider=self.provider, olt=OLT.objects.create(name="OLT de teste"),
+            vlan_description="Uplink", line_profile=1, service_profile=1,
+        )
+        response = self.client.post(self.url, {
+            **self.payload, "action": "remove", "confirmation": preview.context["confirmation"],
+        })
+        self.assertContains(response, "vinculadas a ONUs ou perfis de provisionamento")
+        self.assertTrue(all(vlan.has_profile for vlan in response.context["vlans"]))
+        self.assertEqual(Vlan.objects.count(), 4)
+        edit = reverse("catalog_edit", args=["vlans", self.first.pk])
+        response = self.client.post(edit, {"number": self.first.number, "provider": self.provider.pk, "name": "Outra rede"})
+        self.assertContains(response, "faz parte de um grupo de serviço")
+
     def test_requires_operator_and_csrf(self):
         self.client.force_login(get_user_model().objects.create_user("consulta-remocao"))
         self.assertNotContains(self.client.get(self.catalog), self.url)

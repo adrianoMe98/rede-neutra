@@ -154,6 +154,66 @@ class ProvisioningWorkflowTest(TestCase):
         self.assertFalse(form.is_valid())
         self.assertIn("vlan", form.errors)
 
+    def test_profile_catalog_saves_one_option_for_a_shared_description(self):
+        Vlan.objects.filter(pk=self.vlan.pk).update(name="Uplink")
+        second = Vlan.objects.create(number=101, provider=self.provider, name="Uplink")
+        other_vlans = [
+            Vlan.objects.create(number=number, provider=self.other_provider, name="Uplink")
+            for number in (201, 202)
+        ]
+        group = f"grupo:{self.provider.pk}:Uplink"
+        other_group = f"grupo:{self.other_provider.pk}:Uplink"
+        url = reverse("catalog_create", args=["perfis"])
+        page = self.client.get(url)
+        self.assertContains(page, f'<option value="{group}">Uplink · 2 VLANs</option>', count=1)
+        choices = dict(page.context["form"].fields["vlan"].choices)
+        for vlan in [self.vlan, second, *other_vlans]:
+            self.assertNotIn(str(vlan.pk), choices)
+        payload = {"name": "Perfil por descrição", "provider": self.provider.pk, "olt": self.olt.pk,
+                   "line_profile": 20, "service_profile": 30, "gem_port": 2, "active": "on"}
+        response = self.client.post(url, {**payload, "vlan": other_group})
+        self.assertIn("vlan", response.context["form"].errors)
+        response = self.client.post(url, {**payload, "vlan": group})
+        catalog = reverse("catalog", args=["perfis"])
+        self.assertRedirects(response, catalog)
+        profile = ProvisioningProfile.objects.get(name=payload["name"])
+        self.assertIsNone(profile.vlan_id)
+        self.assertEqual(profile.vlan_description, "Uplink")
+        self.assertContains(self.client.get(catalog), "VLAN escolhida na ONU")
+        edit = reverse("catalog_edit", args=["perfis", profile.pk])
+        self.assertEqual(self.client.get(edit).context["form"]["vlan"].value(), group)
+        fixed_edit = reverse("catalog_edit", args=["perfis", self.profile.pk])
+        self.assertContains(self.client.get(fixed_edit), f'<option value="{self.vlan.pk}" selected>100 · Uplink</option>')
+
+    def test_grouped_profile_provisions_the_vlan_chosen_in_the_onu(self):
+        first = Vlan.objects.create(number=1140, provider=self.provider, name="Uplink")
+        second = Vlan.objects.create(number=1141, provider=self.provider, name="Uplink")
+        Vlan.objects.filter(pk=self.other_vlan.pk).update(name="Uplink")
+        group = ProvisioningProfile.objects.create(
+            name="Perfil Uplink", provider=self.provider, olt=self.olt, vlan_description="Uplink",
+            line_profile=20, service_profile=30, gem_port=2,
+        )
+        url = reverse("onu_create")
+        for wrong_vlan in [self.vlan.pk, self.other_vlan.pk, ""]:
+            with self.subTest(vlan=wrong_vlan):
+                response = self.client.post(url, self.onu_data(profile=group.pk, vlan=wrong_vlan))
+                self.assertTrue(response.context["form"].errors)
+        self.assertFalse(ONU.objects.exists())
+        data = self.onu_data(profile=group.pk, vlan=second.pk)
+        self.assertEqual(self.client.post(url, data).status_code, 302)
+        onu = ONU.objects.get()
+        self.assertEqual(onu.vlan, second)
+        self.assertIn("vlan 1141 gpon", HuaweiAdapter().plan(onu)[-1])
+        self.assertIn("user-vlan 1141", HuaweiAdapter().plan(onu)[-1])
+
+        ProvisioningProfile.objects.filter(pk=group.pk).update(line_profile=40, user_vlan=500)
+        edit = reverse("onu_edit", args=[onu.pk])
+        self.assertEqual(self.client.post(edit, {**data, "vlan": first.pk}).status_code, 302)
+        onu.refresh_from_db()
+        self.assertEqual(onu.vlan, first)
+        self.assertEqual(onu.provisioning_parameters["user_vlan"], 1140)
+        self.assertEqual(onu.provisioning_parameters["line_profile"], 20)
+
     def test_profile_identity_and_vlan_ownership_are_protected(self):
         self.create_onu()
         self.profile.olt = OLT.objects.create(name="Outra OLT")

@@ -7,9 +7,9 @@ from django.contrib.auth import get_user_model
 from django.test import SimpleTestCase, TestCase
 from django.urls import reverse
 
-from .adapters import AdapterError, HuaweiAdapter
+from .adapters import AdapterError, HuaweiAdapter, HuaweiTelnetAdapter, TelnetTerminal
 from .models import CTO, OLT, ONU, Provider, ProvisioningProfile, Vlan
-from .olt_inventory import parse_mac_table, parse_ont_configuration, parse_service_ports
+from .olt_inventory import parse_mac_table, parse_ont_configuration, parse_service_ports, provider_targets
 
 
 SERVICE_PORTS = """
@@ -53,6 +53,41 @@ class InventoryParserTest(SimpleTestCase):
         with self.assertRaises(AdapterError):
             parse_mac_table("Original command output missing")
 
+    def test_pagination_marker_preserves_first_service_port_on_next_page(self):
+        adapter = HuaweiAdapter()
+        channel = Mock()
+        channel.recv_ready.return_value = True
+        channel.recv.side_effect = [
+            b" 10 2300 common gpon 0/0 /0  42  100 vlan 100 - - up\r\n---- Mo",
+            b"re ( Press 'Q' to break ) ----",
+            b"\r          11 2300 common gpon 0/0 /0  43  100 vlan 100 - - up\r\n"
+            b" Total: 2  (Up/Down : 2/0)\r\nOLT(config)#",
+        ]
+        output = adapter.command(channel, "display service-port vlan 2300")
+        self.assertEqual(parse_service_ports(output, 2300), {(0, 0, 0, 42): {10}, (0, 0, 0, 43): {11}})
+        self.assertEqual([call.args[0] for call in channel.sendall.call_args_list],
+                         ["display service-port vlan 2300\n", " "])
+
+    def test_ont_configuration_waits_for_the_device_prompt_between_commands(self):
+        adapter = HuaweiTelnetAdapter()
+        connection = Mock()
+        connection.read_some.side_effect = [
+            b">>User name:",
+            b">>User password:",
+            b"\r\nOLT-TESTE>",
+            ONT_CONFIGURATION.split(" service-port", 1)[0].strip().encode() + b"\r\n  <bbs-config>",
+            b"\r\n service-port 1454 vlan 1141 gpon 0/1/1 ont 7 gemport 100 multi-service"
+            b"\r\n #\r\n return\r\nOLT-TESTE(config)#",
+            SERVICE_PORTS.encode() + b"\nOLT-TESTE(config)#",
+        ]
+        channel = TelnetTerminal(connection)
+        adapter.login(channel, "operador-teste", "senha-teste")
+        output = adapter.command(channel, "display current-configuration ont 0/1/1 7")
+        self.assertIn("service-port 1454", output)
+        self.assertTrue(output.endswith("OLT-TESTE(config)#"))
+        output = adapter.command(channel, "display service-port vlan 1141")
+        self.assertEqual(parse_service_ports(output, 1141), {(0, 1, 1, 7): {1454, 1455}})
+
     def test_distinguishes_serial_from_mac_and_reads_wrapped_description(self):
         ont = parse_ont_configuration(ONT_CONFIGURATION, (0, 1, 1, 7))
         self.assertEqual((ont.description, ont.serial, ont.mac), ("=ONT de teste", "49544253E87309FE", ""))
@@ -92,6 +127,16 @@ class InventoryReportTest(TestCase):
         )
         self.user = get_user_model().objects.create_user("operador", is_staff=True)
         self.url = reverse("olt_inventory")
+
+    def test_vlan_group_targets_all_matching_numbers_on_the_profiles_olt(self):
+        Vlan.objects.filter(pk=self.vlan.pk).update(name="Uplink")
+        Vlan.objects.create(number=1143, provider=self.provider, name="Uplink")
+        Vlan.objects.filter(number=1142).update(name="Uplink")
+        ProvisioningProfile.objects.create(
+            name="Perfil Uplink", provider=self.provider, olt=self.olt, vlan_description="Uplink",
+            line_profile=1, service_profile=1,
+        )
+        self.assertEqual(provider_targets(self.provider), [(self.olt, [1141, 1143]), (self.second_olt, [1141])])
 
     def test_requires_operator_and_post_to_open_ssh(self):
         with patch.object(HuaweiAdapter, "session") as ssh:

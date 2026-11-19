@@ -27,9 +27,29 @@ class UncertainResult(AdapterError):
     """Uma alteração pode ter ocorrido. Exige conferência presencial na CLI."""
 
 
-CLI_PROMPT = re.compile(r"(?:^|\n)[ \t]*(?:<[\w.-]+>|[\w.-]+(?:\([^\n]*\))?[>#])[ \t]*\n?\Z")
-LOGIN_PROMPT = re.compile(r"(?:^|\n)[ \t]*(?:user[ \t]*name|login)[ \t]*:[ \t]*\n?\Z", re.I)
-PASSWORD_PROMPT = re.compile(r"(?:^|\n)[ \t]*password[ \t]*:[ \t]*\n?\Z", re.I)
+class PromptTimeout(AdapterError):
+    """O equipamento não retornou o prompt esperado a tempo."""
+
+
+class TelnetLoginTimeout(AdapterError):
+    """O login não avançou para o prompt esperado."""
+
+
+def cli_prompt_pattern(hostname=r"[\w.-]+"):
+    return re.compile(
+        rf"(?:^|\n)[ \t]*(?:<({hostname})>|({hostname})(?:\([^\n]*\))?[>#])[ \t]*\n?\Z"
+    )
+
+
+CLI_PROMPT = cli_prompt_pattern()
+LOGIN_PROMPT = re.compile(r"(?:^|\n)[ \t]*(?:>>[ \t]*)?(?:user[ \t]*name|login)[ \t]*:[ \t]*\n?\Z", re.I)
+PASSWORD_PROMPT = re.compile(r"(?:^|\n)[ \t]*(?:>>[ \t]*)?(?:user[ \t]+)?password[ \t]*:[ \t]*\n?\Z", re.I)
+LOGIN_REJECTED = re.compile(
+    r"(?:^|\n)[ \t]*(?:(?:error|failure)[ \t]*:[ \t]*)?"
+    r"(?:invalid password|incorrect password|authentication failed|login failed|access denied)[.!]?[ \t]*\n?\Z",
+    re.I,
+)
+PAGINATION_MARKER = re.compile(r"^[ \t]*(?:----[ \t]*More[^\n]*?----|--More--)", re.I | re.M)
 
 
 class TelnetTerminal:
@@ -40,7 +60,7 @@ class TelnetTerminal:
         try:
             return self.connection.read_some(timeout=timeout)
         except TimeoutError:
-            raise AdapterError("A OLT não retornou um prompt no tempo esperado.") from None
+            raise PromptTimeout("A OLT não retornou um prompt no tempo esperado.") from None
         except (EOFError, OSError):
             raise AdapterError("A conexão Telnet foi interrompida.") from None
 
@@ -271,7 +291,10 @@ class HuaweiAdapter:
         finally:
             client.close()
 
-    def read_prompt(self, channel, *, prompts=(CLI_PROMPT,)):
+    def read_prompt(self, channel, *, prompts=None):
+        if prompts is None:
+            cli_prompt = getattr(channel, "cli_prompt", None)
+            prompts = (cli_prompt if isinstance(cli_prompt, re.Pattern) else CLI_PROMPT,)
         deadline = time.monotonic() + 15
         output = ""
         decoder = getincrementaldecoder("utf-8")("replace")
@@ -294,17 +317,24 @@ class HuaweiAdapter:
                 raise AdapterError(f"Resposta {self.protocol} acima do limite.")
             cleaned = self.clean_output(output)
             # O marcador de paginação pode chegar dividido em vários pacotes.
-            for marker in re.finditer(r"----\s*More[^\n]*?----|--More--", cleaned, re.I):
+            for marker in PAGINATION_MARKER.finditer(cleaned):
                 if marker.end() > paged_at:
                     channel.sendall(" ")
                     paged_at = marker.end()
+            # A OLT pode escrever o primeiro registro da página na linha do marcador.
+            cleaned = PAGINATION_MARKER.sub("", cleaned)
             # Huawei pede Enter para finalizar argumentos opcionais da CLI.
             if len(output) != completed_at and re.search(r"\{\s*<cr>[^\n]*\}\s*:\s*$", cleaned, re.I):
                 channel.sendall("\n")
                 completed_at = len(output)
-            if any(prompt.search(cleaned) for prompt in prompts):
-                return cleaned
-        raise AdapterError("A OLT não retornou um prompt no tempo esperado.")
+            for prompt in prompts:
+                if match := prompt.search(cleaned):
+                    if prompt is CLI_PROMPT:
+                        # Seções como <bbs-config> também chegam sozinhas em um pacote.
+                        hostname = match[1] or match[2]
+                        channel.cli_prompt = cli_prompt_pattern(re.escape(hostname))
+                    return cleaned
+        raise PromptTimeout("A OLT não retornou um prompt no tempo esperado.")
 
     def command(self, channel, command, *, empty_response=None):
         channel.sendall(command + "\n")
@@ -367,19 +397,26 @@ class HuaweiTelnetAdapter(HuaweiAdapter):
     protocol = "Telnet"
 
     def login(self, channel, username, password):
+        expected = "o prompt inicial"
         try:
             initial = self.read_prompt(channel, prompts=(LOGIN_PROMPT, PASSWORD_PROMPT))
             if LOGIN_PROMPT.search(initial):
                 channel.sendall(username + "\n")
-                challenge = self.read_prompt(channel, prompts=(LOGIN_PROMPT, PASSWORD_PROMPT))
+                expected = "o prompt de senha"
+                challenge = self.read_prompt(channel, prompts=(LOGIN_PROMPT, PASSWORD_PROMPT, LOGIN_REJECTED))
                 if not PASSWORD_PROMPT.search(challenge):
-                    raise AdapterError("A OLT repetiu o pedido de usuário.")
+                    raise AdapterError("A OLT recusou o usuário cadastrado para o login Telnet.", code="authentication")
             channel.sendall(password + "\n")
-            result = self.read_prompt(channel, prompts=(CLI_PROMPT, LOGIN_PROMPT, PASSWORD_PROMPT))
+            expected = "o prompt da CLI após o envio da senha"
+            result = self.read_prompt(channel, prompts=(CLI_PROMPT, LOGIN_PROMPT, PASSWORD_PROMPT, LOGIN_REJECTED))
             if not CLI_PROMPT.search(result):
-                raise AdapterError("A OLT solicitou novas credenciais.")
-        except AdapterError:
-            raise AdapterError("A OLT não confirmou o login Telnet. Confira as credenciais e os prompts do equipamento.", code="authentication") from None
+                raise AdapterError("A OLT recusou o login Telnet. Confira o usuário e a senha cadastrados.", code="authentication")
+        except PromptTimeout:
+            raise TelnetLoginTimeout(f"Tempo esgotado aguardando {expected} no login Telnet.", code="authentication") from None
+        except AdapterError as error:
+            if error.code == "authentication":
+                raise
+            raise AdapterError("A sessão Telnet foi interrompida durante o login.", code="authentication") from None
 
     @contextmanager
     def session(self, olt, *, read_only=False):
@@ -387,19 +424,27 @@ class HuaweiTelnetAdapter(HuaweiAdapter):
         password = self.read_password(olt)
         if not password or any(char in value for value in (olt.username, password) for char in "\r\n\x00"):
             raise AdapterError("Informe credenciais Telnet válidas para o login da OLT.", code="authentication")
-        connection = TelnetConnection(olt.host, port=olt.telnet_port, timeout=10, connect_timeout=10,
-                                      encoding=False, cols=240, rows=100)
-        try:
+        attempts = 2 if read_only else 1
+        for attempt in range(attempts):
+            connection = TelnetConnection(olt.host, port=olt.telnet_port, timeout=10, connect_timeout=10,
+                                          encoding=False, cols=240, rows=100)
             try:
-                connection.connect()
-            except (OSError, EOFError):
-                raise AdapterError("Não foi possível abrir a conexão Telnet. Confira IP, porta, rota e acesso à rede de gerenciamento.", code="network") from None
-            channel = TelnetTerminal(connection)
-            self.login(channel, olt.username, password)
-            self.check_firmware(channel, olt)
-            yield channel
-        finally:
-            connection.close()
+                try:
+                    connection.connect()
+                except (OSError, EOFError):
+                    raise AdapterError("Não foi possível abrir a conexão Telnet. Confira IP, porta, rota e acesso à rede de gerenciamento.", code="network") from None
+                channel = TelnetTerminal(connection)
+                try:
+                    self.login(channel, olt.username, password)
+                except TelnetLoginTimeout:
+                    if attempt + 1 == attempts:
+                        raise
+                    continue
+                self.check_firmware(channel, olt)
+                yield channel
+                return
+            finally:
+                connection.close()
 
 
 def get_adapter(olt):
