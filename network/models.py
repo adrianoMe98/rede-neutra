@@ -62,7 +62,8 @@ class CTO(models.Model):
 
 class OLT(models.Model):
     VENDORS = [("huawei", "Huawei"), ("zte", "ZTE"), ("fiberhome", "FiberHome"), ("other", "Outro fabricante")]
-    MODES = [("simulation", "Simulação"), ("ssh", "SSH • Huawei (experimental)")]
+    MODES = [("simulation", "Simulação"), ("ssh", "SSH • Huawei (experimental)"),
+             ("telnet", "Telnet • Huawei (experimental)")]
     name = models.CharField("nome da OLT", max_length=80, unique=True)
     vendor = models.CharField("fabricante", max_length=20, choices=VENDORS, default="huawei")
     model = models.CharField("modelo / firmware", max_length=120, blank=True)
@@ -72,7 +73,8 @@ class OLT(models.Model):
     host = models.CharField("IP / hostname de gerenciamento", max_length=253, blank=True,
                             validators=[RegexValidator(r"^[a-zA-Z0-9_.:-]+$", "Informe um IP ou hostname válido.")])
     ssh_port = models.PositiveIntegerField("porta SSH", default=22, validators=bounded(1, 65535))
-    username = models.CharField("usuário SSH", max_length=80, blank=True)
+    telnet_port = models.PositiveIntegerField("porta Telnet", default=23, validators=bounded(1, 65535))
+    username = models.CharField("usuário de gerenciamento", max_length=80, blank=True)
     encrypted_password = models.TextField(blank=True, editable=False)
     line_profile = models.PositiveIntegerField("ID do line profile", default=10, validators=bounded(1, 4095))
     service_profile = models.PositiveIntegerField("ID do service profile", default=10, validators=bounded(1, 4095))
@@ -82,12 +84,23 @@ class OLT(models.Model):
         ordering = ["name"]
         verbose_name = "OLT"
 
+    @property
+    def connection_port(self):
+        return self.telnet_port if self.mode == "telnet" else self.ssh_port
+
+    @property
+    def transport_label(self):
+        return "Telnet" if self.mode == "telnet" else "SSH"
+
     def clean(self):
-        if self.mode == "ssh" and (self.vendor != "huawei" or not self.host or not self.username):
-            raise ValidationError("O adaptador SSH disponível exige Huawei, endereço e usuário. Outros fabricantes usam simulação.")
+        if self.mode in {"ssh", "telnet"} and (self.vendor != "huawei" or not self.host or not self.username):
+            raise ValidationError("A integração por SSH ou Telnet exige OLT Huawei, endereço e usuário.")
         if self.pk and self.onus.exclude(status=ONU.Status.DRAFT).exists():
             original = type(self).objects.get(pk=self.pk)
-            if any(getattr(original, f) != getattr(self, f) for f in ["vendor", "mode", "host", "ssh_port"]):
+            identity_changed = (self.vendor, self.host) != (original.vendor, original.host)
+            simulation_changed = self.mode != original.mode and "simulation" in (self.mode, original.mode)
+            port_changed = self.mode == original.mode and self.connection_port != original.connection_port
+            if identity_changed or simulation_changed or port_changed:
                 raise ValidationError("A OLT tem ONUs provisionadas ou pendentes de conferência. Sua identidade e integração não podem ser alteradas.")
 
     def set_password(self, raw):
@@ -234,7 +247,7 @@ class DiscoveryScan(models.Model):
 class OLTConnectionTest(models.Model):
     STAGES = [
         ("ready", "Concluído"), ("configuration", "Configuração"), ("host_key", "Chave SSH"),
-        ("network", "Rede / porta SSH"), ("ssh", "Negociação SSH"),
+        ("network", "Rede / porta TCP"), ("ssh", "Negociação SSH"),
         ("authentication", "Autenticação"), ("cli", "CLI / permissões"),
         ("firmware", "Firmware"), ("unexpected", "Falha inesperada"),
     ]

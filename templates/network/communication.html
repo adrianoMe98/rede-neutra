@@ -1,10 +1,10 @@
 {% extends 'base.html' %}
-{% block subtitle %}<p>Verifique a conexão SSH, a autenticação, o prompt e o firmware do equipamento.</p>{% endblock %}
+{% block subtitle %}<p>Verifique a conexão, a autenticação, o prompt e o firmware do equipamento.</p>{% endblock %}
 {% block actions %}<div class="actions"><a class="button secondary" href="{% url 'catalog_edit' 'olts' olt.pk %}">Editar OLT</a><a class="button secondary" href="{% url 'catalog' 'olts' %}">← OLTs</a></div>{% endblock %}
 {% block content %}
 <section class="panel"><div class="panel-heading"><div><h2>{{ olt.name }}</h2><p>{{ olt.get_vendor_display }} · {{ olt.model|default:'Modelo não informado' }} · {{ olt.firmware|default:'Firmware não informado' }}</p></div><span class="badge {% if olt.mode == 'simulation' %}simulation{% else %}draft{% endif %}">{{ olt.get_mode_display }}</span></div>
 <form class="communication-form" method="post">{% csrf_token %}
-  <p>{% if olt.mode == 'simulation' %}Esta OLT está em simulação. O teste demonstrativo será identificado no resultado.{% else %}Destino salvo: <strong class="mono">{{ olt.host }}:{{ olt.ssh_port }}</strong>. O teste verifica a chave SSH cadastrada, faz a autenticação e consulta <code>display version</code>.{% endif %}</p>
+  <p>{% if olt.mode == 'simulation' %}Esta OLT está em simulação. O teste demonstrativo será identificado no resultado.{% else %}Destino {{ olt.transport_label }} <strong class="mono">{{ olt.host }}:{{ olt.connection_port }}</strong>. {% if olt.mode == 'ssh' %}O teste valida a chave SSH cadastrada, autentica e consulta <code>display version</code>.{% else %}O teste autentica e consulta <code>display version</code> pela rede de gerenciamento. O Telnet transmite credenciais sem criptografia.{% endif %}{% endif %}</p>
   <p class="hint">Salve alterações no cadastro antes de executar. Testes e buscas são consultas; o provisionamento continua sujeito à liberação de envio.</p>
   <button type="submit" class="button primary">Testar comunicação</button>
 </form></section>

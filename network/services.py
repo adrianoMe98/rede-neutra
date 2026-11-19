@@ -8,7 +8,7 @@ def provision(onu, actor):
     adapter = get_adapter(onu.olt)
     onu.full_clean()
     adapter.plan(onu)
-    if onu.olt.mode == "ssh":
+    if onu.olt.mode != "simulation":
         adapter.preflight(onu.olt)
     # Compare-and-swap: o mesmo cadastro não pode ser enviado duas vezes.
     with transaction.atomic():

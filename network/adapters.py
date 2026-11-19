@@ -4,12 +4,14 @@ import re
 import socket
 import time
 import unicodedata
+from codecs import getincrementaldecoder
 from contextlib import contextmanager
 from dataclasses import dataclass
 
 import paramiko
 from django.conf import settings
 from django.core.exceptions import ValidationError
+from telnetlib3.sync import TelnetConnection
 from .serials import normalize_serial
 
 
@@ -23,6 +25,31 @@ class AdapterError(Exception):
 
 class UncertainResult(AdapterError):
     """Uma alteração pode ter ocorrido. Exige conferência presencial na CLI."""
+
+
+CLI_PROMPT = re.compile(r"(?:^|\n)[ \t]*(?:<[\w.-]+>|[\w.-]+(?:\([^\n]*\))?[>#])[ \t]*\n?\Z")
+LOGIN_PROMPT = re.compile(r"(?:^|\n)[ \t]*(?:user[ \t]*name|login)[ \t]*:[ \t]*\n?\Z", re.I)
+PASSWORD_PROMPT = re.compile(r"(?:^|\n)[ \t]*password[ \t]*:[ \t]*\n?\Z", re.I)
+
+
+class TelnetTerminal:
+    def __init__(self, connection):
+        self.connection = connection
+
+    def read(self, timeout):
+        try:
+            return self.connection.read_some(timeout=timeout)
+        except TimeoutError:
+            raise AdapterError("A OLT não retornou um prompt no tempo esperado.") from None
+        except (EOFError, OSError):
+            raise AdapterError("A conexão Telnet foi interrompida.") from None
+
+    def sendall(self, text):
+        try:
+            self.connection.write(text.replace("\n", "\r\n").encode("utf-8"))
+            self.connection.flush()
+        except (EOFError, OSError):
+            raise AdapterError("A conexão Telnet foi interrompida durante o envio.") from None
 
 
 @dataclass(frozen=True)
@@ -75,6 +102,8 @@ class HuaweiAdapter:
     remove ONUs nem faz rollback automático de alterações remotas.
     """
 
+    protocol = "SSH"
+
     def plan(self, onu):
         if not re.fullmatch(r"(?:[A-Z]{4}[0-9A-F]{8}|[0-9A-F]{16})", onu.serial):
             raise AdapterError("Para Huawei, use serial com 4 letras + 8 hexadecimais ou 16 hexadecimais.")
@@ -104,7 +133,7 @@ class HuaweiAdapter:
         output = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", output)
         while "\b" in output:
             output = re.sub(r"[^\n\b]\x08|^\x08", "", output, flags=re.M)
-        return output.replace("\r", "")
+        return output.replace("\r\x00", "").replace("\r", "")
 
     @staticmethod
     def empty_discovery(output):
@@ -174,17 +203,28 @@ class HuaweiAdapter:
 
     def test_connection(self, olt):
         with self.session(olt, read_only=True):
-            return f"Comunicação SSH confirmada: autenticação, prompt e firmware {olt.firmware} verificados."
+            return f"Comunicação {self.protocol} confirmada: autenticação, prompt e firmware {olt.firmware} verificados."
 
     def preflight(self, olt, *, read_only=False):
         if not read_only and not settings.ENABLE_LIVE_OLT:
-            raise AdapterError("Provisionamento SSH desabilitado. Homologue modelo/firmware e configure ENABLE_LIVE_OLT=1 para habilitar o envio.", code="configuration")
+            raise AdapterError(f"Provisionamento {self.protocol} desabilitado. Homologue modelo/firmware e configure ENABLE_LIVE_OLT=1 para habilitar o envio.", code="configuration")
         if not olt.model or not olt.host or not olt.username:
             raise AdapterError("Preencha modelo/firmware, endereço e usuário da OLT.", code="configuration")
         target = olt.model.upper().replace("-", "").replace(" ", "")
         expected = {"MA5800X7": "MA5800V100R022C11", "MA5683T": "MA5600V800R017C10"}
         if target not in expected or olt.firmware != expected[target]:
-            raise AdapterError("O alvo SSH deve ser MA5800-X7 / MA5800V100R022C11 ou MA5683T / MA5600V800R017C10.", code="configuration")
+            raise AdapterError(f"O alvo {self.protocol} deve ser MA5800-X7 / MA5800V100R022C11 ou MA5683T / MA5600V800R017C10.", code="configuration")
+
+    def read_password(self, olt):
+        try:
+            return olt.get_password()
+        except ValidationError:
+            raise AdapterError(f"Não foi possível recuperar a senha {self.protocol}. Confira OLT_CREDENTIAL_KEY e recadastre a senha da OLT.", code="authentication") from None
+
+    def check_firmware(self, channel, olt):
+        version = self.command(channel, "display version")
+        if olt.firmware not in version:
+            raise AdapterError(f"A OLT respondeu por {self.protocol}, mas o firmware informado não corresponde ao retornado pela OLT.", code="firmware")
 
     @contextmanager
     def session(self, olt, *, read_only=False):
@@ -199,17 +239,12 @@ class HuaweiAdapter:
             host_key_name = olt.host if olt.ssh_port == 22 else f"[{olt.host}]:{olt.ssh_port}"
             if not client.get_host_keys().lookup(host_key_name):
                 raise AdapterError("A chave SSH desta OLT/porta não está cadastrada em known_hosts. Confira a impressão digital com o responsável pela rede e cadastre a chave.", code="host_key")
-            try:
-                password = olt.get_password()
-            except ValidationError:
-                raise AdapterError("Não foi possível recuperar a senha SSH. Confira OLT_CREDENTIAL_KEY e recadastre a senha da OLT.", code="authentication") from None
+            password = self.read_password(olt)
             client.connect(olt.host, port=olt.ssh_port, username=olt.username, password=password,
                            look_for_keys=False, allow_agent=False, timeout=10, auth_timeout=10, banner_timeout=10)
             channel = client.invoke_shell(width=240, height=100)
             self.read_prompt(channel)
-            version = self.command(channel, "display version")
-            if olt.firmware not in version:
-                raise AdapterError("A OLT respondeu por SSH, mas o firmware informado não corresponde ao retornado pela OLT.", code="firmware")
+            self.check_firmware(channel, olt)
         except AdapterError:
             client.close()
             raise
@@ -236,43 +271,52 @@ class HuaweiAdapter:
         finally:
             client.close()
 
-    def read_prompt(self, channel):
+    def read_prompt(self, channel, *, prompts=(CLI_PROMPT,)):
         deadline = time.monotonic() + 15
         output = ""
+        decoder = getincrementaldecoder("utf-8")("replace")
         completed_at = -1
         paged_at = 0
-        while time.monotonic() < deadline:
-            if channel.recv_ready():
-                chunk = channel.recv(65536).decode("utf-8", "replace")
-                if not chunk:
-                    raise AdapterError("A OLT encerrou a conexão.")
-                output += chunk
-                if len(output) > 1_000_000:
-                    raise AdapterError("Resposta SSH acima do limite.")
-                cleaned = self.clean_output(output)
-                # O marcador de paginação pode chegar dividido em vários pacotes.
-                markers = list(re.finditer(r"----\s*More[^\n]*?----|--More--", cleaned, re.I))
-                for marker in markers:
-                    if marker.end() > paged_at:
-                        channel.sendall(" ")
-                        paged_at = marker.end()
-                # Huawei pede Enter para finalizar argumentos opcionais da CLI.
-                if len(output) != completed_at and re.search(r"\{\s*<cr>[^\n]*\}\s*:\s*$", cleaned, re.I):
-                    channel.sendall("\n")
-                    completed_at = len(output)
-                if re.search(r"(?:^|\n)[ \t]*(?:<[\w.-]+>|[\w.-]+(?:\([^\n]*\))?[>#])[ \t]*$", cleaned):
-                    return cleaned
-            if channel.closed or channel.exit_status_ready():
+        while (remaining := deadline - time.monotonic()) > 0:
+            if isinstance(channel, TelnetTerminal):
+                chunk = channel.read(remaining)
+            elif channel.recv_ready():
+                chunk = channel.recv(65536)
+            elif channel.closed or channel.exit_status_ready():
                 raise AdapterError("A OLT encerrou a conexão antes da confirmação.")
-            time.sleep(0.05)
+            else:
+                time.sleep(0.05)
+                continue
+            if not chunk:
+                raise AdapterError("A OLT encerrou a conexão.")
+            output += decoder.decode(chunk)
+            if len(output) > 1_000_000:
+                raise AdapterError(f"Resposta {self.protocol} acima do limite.")
+            cleaned = self.clean_output(output)
+            # O marcador de paginação pode chegar dividido em vários pacotes.
+            for marker in re.finditer(r"----\s*More[^\n]*?----|--More--", cleaned, re.I):
+                if marker.end() > paged_at:
+                    channel.sendall(" ")
+                    paged_at = marker.end()
+            # Huawei pede Enter para finalizar argumentos opcionais da CLI.
+            if len(output) != completed_at and re.search(r"\{\s*<cr>[^\n]*\}\s*:\s*$", cleaned, re.I):
+                channel.sendall("\n")
+                completed_at = len(output)
+            if any(prompt.search(cleaned) for prompt in prompts):
+                return cleaned
         raise AdapterError("A OLT não retornou um prompt no tempo esperado.")
 
-    def command(self, channel, command):
+    def command(self, channel, command, *, empty_response=None):
         channel.sendall(command + "\n")
         output = self.read_prompt(channel)
-        errors = re.compile(r"Failure|Error\s*:|Unknown command|Unrecognized command|does not exist|do not exist|already exists|(?:permission|access) denied|insufficient privilege", re.I)
+        error_pattern = r"Failure|Error\s*:|Unknown command|Unrecognized command|does not exist|do not exist|already exists|(?:permission|access) denied|insufficient privilege"
+        if command.startswith("display current-configuration ont "):
+            # A descrição do assinante pode conter palavras da lista de erros.
+            error_pattern = rf"^\s*(?:%\s*)?(?:{error_pattern})"
+        errors = re.compile(error_pattern, re.I)
         for line in output.splitlines():
             allowed_empty = command == "display ont autofind all" and self.empty_discovery(line)
+            allowed_empty = allowed_empty or (empty_response is not None and empty_response(line))
             if errors.search(line) and not allowed_empty:
                 raise AdapterError("A OLT rejeitou um comando da CLI. Confira as permissões da conta SSH e o formato suportado pelo firmware; a resposta bruta não é salva no ERP.")
         return output
@@ -319,9 +363,50 @@ class HuaweiAdapter:
             return self.parse_optics(self.command(channel, f"display ont optical-info {onu.pon} {onu.ont_id}"))
 
 
+class HuaweiTelnetAdapter(HuaweiAdapter):
+    protocol = "Telnet"
+
+    def login(self, channel, username, password):
+        try:
+            initial = self.read_prompt(channel, prompts=(LOGIN_PROMPT, PASSWORD_PROMPT))
+            if LOGIN_PROMPT.search(initial):
+                channel.sendall(username + "\n")
+                challenge = self.read_prompt(channel, prompts=(LOGIN_PROMPT, PASSWORD_PROMPT))
+                if not PASSWORD_PROMPT.search(challenge):
+                    raise AdapterError("A OLT repetiu o pedido de usuário.")
+            channel.sendall(password + "\n")
+            result = self.read_prompt(channel, prompts=(CLI_PROMPT, LOGIN_PROMPT, PASSWORD_PROMPT))
+            if not CLI_PROMPT.search(result):
+                raise AdapterError("A OLT solicitou novas credenciais.")
+        except AdapterError:
+            raise AdapterError("A OLT não confirmou o login Telnet. Confira as credenciais e os prompts do equipamento.", code="authentication") from None
+
+    @contextmanager
+    def session(self, olt, *, read_only=False):
+        self.preflight(olt, read_only=read_only)
+        password = self.read_password(olt)
+        if not password or any(char in value for value in (olt.username, password) for char in "\r\n\x00"):
+            raise AdapterError("Informe credenciais Telnet válidas para o login da OLT.", code="authentication")
+        connection = TelnetConnection(olt.host, port=olt.telnet_port, timeout=10, connect_timeout=10,
+                                      encoding=False, cols=240, rows=100)
+        try:
+            try:
+                connection.connect()
+            except (OSError, EOFError):
+                raise AdapterError("Não foi possível abrir a conexão Telnet. Confira IP, porta, rota e acesso à rede de gerenciamento.", code="network") from None
+            channel = TelnetTerminal(connection)
+            self.login(channel, olt.username, password)
+            self.check_firmware(channel, olt)
+            yield channel
+        finally:
+            connection.close()
+
+
 def get_adapter(olt):
     if olt.mode == "simulation":
         return SimulatedAdapter()
     if olt.mode == "ssh" and olt.vendor == "huawei":
         return HuaweiAdapter()
+    if olt.mode == "telnet" and olt.vendor == "huawei":
+        return HuaweiTelnetAdapter()
     raise AdapterError("Não há adaptador homologado para esta combinação. Use simulação até integrar o fabricante.")

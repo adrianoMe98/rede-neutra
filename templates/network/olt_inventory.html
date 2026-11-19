@@ -1,0 +1,18 @@
+{% extends 'base.html' %}
+{% block actions %}<a class="button secondary" href="{% url 'reports' %}">← Relatórios</a>{% endblock %}
+{% block content %}
+<section class="panel">
+  <form class="communication-form" method="post">
+    {% csrf_token %}
+    <p>Consulte as VLANs de serviço vinculadas ao provedor nas OLTs Huawei e baixe a descrição, o serial GPON e os endereços MAC em XLSX.</p>
+    {{ form.non_field_errors }}
+    <div class="field">
+      {{ form.provider.label_tag }}
+      {{ form.provider }}
+      {{ form.provider.errors }}
+    </div>
+    <p class="hint">A aba Consultas mostra o resultado por OLT e VLAN. O tempo de busca varia com a quantidade de ONTs.</p>
+    <button class="button primary" type="submit">Consultar e baixar XLSX</button>
+  </form>
+</section>
+{% endblock %}

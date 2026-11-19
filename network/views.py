@@ -1,21 +1,29 @@
 import csv
 from functools import wraps
+from itertools import batched
 
 from django.contrib import messages
 from django.contrib.auth.decorators import login_required
+from django.core import signing
 from django.core.exceptions import PermissionDenied, ValidationError
 from django.core.paginator import Paginator
-from django.db import IntegrityError
-from django.db.models import Count, OuterRef, Q, Subquery
-from django.http import HttpResponse, JsonResponse
+from django.db import IntegrityError, OperationalError, transaction
+from django.db.models import Count, Exists, OuterRef, ProtectedError, Q, Subquery
+from django.http import FileResponse, HttpResponse, JsonResponse
 from django.shortcuts import get_object_or_404, redirect, render
-from django.views.decorators.http import require_POST
+from django.urls import reverse
+from django.views.decorators.http import require_http_methods, require_POST
 
 from .adapters import AdapterError, get_adapter
 from .communication import check_olt_connection
 from .discovery import load_discovery, scan_olt, validate_selection
-from .forms import CTOForm, DiscoveryForm, OLTForm, ONUForm, ProviderForm, ProvisioningProfileForm, VlanForm
+from .forms import (
+    CTOForm, DiscoveryForm, InventoryForm, OLTForm, ONUForm, ProviderForm,
+    ProvisioningProfileForm, VlanForm, VlanIntervalForm, VlanRangeForm,
+)
+from .inventory_xlsx import inventory_workbook
 from .models import CTO, OLT, ONU, DiscoveryScan, OLTConnectionTest, Operation, Provider, ProvisioningProfile, Vlan
+from .olt_inventory import provider_targets
 from .services import provision, refresh_optics
 from .serials import serial_aliases
 
@@ -110,6 +118,91 @@ def catalog_edit(request, kind, pk=None):
                                                  "vlans_data": list(Vlan.objects.values("id", "provider_id"))})
 
 
+@operator
+@require_http_methods(["GET", "POST"])
+def vlan_range_create(request):
+    form = VlanRangeForm(request.POST if request.method == "POST" else None)
+    if request.method == "POST" and form.is_valid():
+        try:
+            created, existing = form.save()
+        except ValidationError as exc:
+            form.add_error(None, exc)
+        except IntegrityError:
+            form.add_error(None, "Os cadastros de VLAN mudaram durante a operação. Confira a faixa e tente novamente.")
+        except OperationalError as exc:
+            if not getattr(exc.__cause__, "sqlite_errorname", "").startswith(("SQLITE_BUSY", "SQLITE_LOCKED")):
+                raise
+            form.add_error(None, "Há outro cadastro em andamento. Tente salvar a faixa novamente.")
+        else:
+            count = f"{created} {'VLAN cadastrada' if created == 1 else 'VLANs cadastradas'}."
+            if existing:
+                count += f" Já {'existia' if existing == 1 else 'existiam'} {existing} para o provedor."
+            messages.success(request, count)
+            return redirect("catalog", kind="vlans")
+    return render(request, "network/form.html", {
+        "form": form, "title": "Cadastrar faixa de VLANs", "page": "vlans", "kind": "vlan_range",
+        "back_url": reverse("catalog", kwargs={"kind": "vlans"}),
+    })
+
+
+VLAN_REMOVAL_SALT = "network.vlan-range-removal"
+
+
+def vlan_removal_selection(user, form, vlans):
+    return {
+        "user": user.pk,
+        "provider": form.cleaned_data["provider"].pk,
+        "bounds": [form.cleaned_data["first"], form.cleaned_data["last"]],
+        "vlans": [[vlan.pk, vlan.number] for vlan in vlans],
+    }
+
+
+@operator
+@require_http_methods(["GET", "POST"])
+def vlan_range_remove(request):
+    form = VlanIntervalForm(request.POST if request.method == "POST" else None)
+    vlans, confirmation = None, ""
+    if request.method == "POST" and form.is_valid():
+        targets = form.vlan_range().filter(provider=form.cleaned_data["provider"])
+        if request.POST.get("action") == "remove":
+            try:
+                reviewed = signing.loads(request.POST.get("confirmation", ""), salt=VLAN_REMOVAL_SALT)
+                with transaction.atomic():
+                    locked = list(targets.select_for_update())
+                    if not locked or reviewed != vlan_removal_selection(request.user, form, locked):
+                        raise ValidationError("A seleção mudou. Confira a nova prévia antes de remover.")
+                    for ids in batched((vlan.pk for vlan in locked), 500):
+                        targets.filter(pk__in=ids).delete()
+            except signing.BadSignature:
+                form.add_error(None, "A confirmação é inválida. Confira a prévia antes de remover.")
+            except ValidationError as exc:
+                form.add_error(None, exc)
+            except ProtectedError:
+                form.add_error(None, "Há VLANs da faixa vinculadas a ONUs ou perfis de provisionamento.")
+            except IntegrityError:
+                form.add_error(None, "Os vínculos mudaram durante a operação. Confira a prévia.")
+            except OperationalError as exc:
+                if not getattr(exc.__cause__, "sqlite_errorname", "").startswith(("SQLITE_BUSY", "SQLITE_LOCKED")):
+                    raise
+                form.add_error(None, "Há outra alteração em andamento. Confira a prévia e confirme novamente.")
+            else:
+                count = len(locked)
+                messages.success(request, f"{count} {'VLAN removida' if count == 1 else 'VLANs removidas'} do ERP.")
+                return redirect("catalog", kind="vlans")
+        vlans = list(targets.annotate(
+            has_onu=Exists(ONU.objects.filter(vlan_id=OuterRef("pk"))),
+            has_profile=Exists(ProvisioningProfile.objects.filter(vlan_id=OuterRef("pk"))),
+        ))
+        if vlans and not any(vlan.has_onu or vlan.has_profile for vlan in vlans):
+            selection = vlan_removal_selection(request.user, form, vlans)
+            confirmation = signing.dumps(selection, salt=VLAN_REMOVAL_SALT, compress=True)
+    return render(request, "network/vlan_range_remove.html", {
+        "form": form, "title": "Remover faixa de VLANs", "page": "vlans",
+        "back_url": reverse("catalog", kwargs={"kind": "vlans"}), "vlans": vlans,
+        "confirmation": confirmation,
+    })
+
+
 def filtered_onus(request):
     query = ONU.objects.select_related("provider", "vlan", "cto", "olt")
     q = request.GET.get("q", "").strip()
@@ -132,6 +225,23 @@ def onu_list(request, report=False):
         "providers": Provider.objects.all(), "vlans": Vlan.objects.all(), "ctos": CTO.objects.all(), "olts": OLT.objects.all(),
         "statuses": ONU.Status.choices, "report": report, "page": "reports" if report else "onus",
         "title": "Relatórios" if report else "ONTs e ONUs", "query_string": request.GET.urlencode()})
+
+
+@operator
+@require_http_methods(["GET", "POST"])
+def olt_inventory(request):
+    form = InventoryForm(request.POST if request.method == "POST" else None)
+    if request.method == "POST" and form.is_valid():
+        provider = form.cleaned_data["provider"]
+        targets = provider_targets(provider)
+        if targets:
+            return FileResponse(
+                inventory_workbook(provider, targets), as_attachment=True, filename=f"onts-provedor-{provider.pk}.xlsx",
+                content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                headers={"Cache-Control": "private, no-store"},
+            )
+        form.add_error("provider", "Este provedor não tem OLT e VLAN vinculadas por perfil ou cadastro de ONU.")
+    return render(request, "network/olt_inventory.html", {"form": form, "title": "Inventário de ONTs por VLAN", "page": "reports"})
 
 
 @operator
@@ -276,5 +386,5 @@ def export_csv(request):
         writer.writerow([csv_safe(v) for v in [onu.description, onu.provider.name, onu.serial, onu.olt.name,
             onu.pon_address, onu.ont_id, onu.cto.name, onu.port, onu.vlan.number,
             onu.tx_dbm, onu.rx_dbm, onu.measured_at.isoformat() if onu.measured_at else "", onu.get_status_display(),
-            "Simulação" if onu.olt.mode == "simulation" else "OLT via SSH"]])
+            "Simulação" if onu.olt.mode == "simulation" else f"OLT via {onu.olt.transport_label}"]])
     return response

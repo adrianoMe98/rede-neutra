@@ -1,0 +1,40 @@
+{% extends 'network/form.html' %}
+{% block subtitle %}<p>Escolha o provedor e revise as VLANs da faixa antes de removê-las do ERP.</p>{% endblock %}
+{% block submit_label %}Prévia da remoção{% endblock %}
+{% block after_form %}
+{% if vlans is not None %}
+<section class="panel">
+  <div class="panel-heading"><div>
+    <h2>VLANs selecionadas</h2>
+    <p>{{ form.cleaned_data.provider.name }} · Faixa de {{ form.cleaned_data.first }} a {{ form.cleaned_data.last }}</p>
+  </div></div>
+  {% if vlans %}
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>VLAN</th><th>Descrição</th><th>Vínculos</th></tr></thead>
+      <tbody>
+      {% for vlan in vlans %}
+        <tr>
+          <td><span class="vlan-chip">{{ vlan.number }}</span></td>
+          <td>{{ vlan.name|default:'—' }}</td>
+          <td>{% if vlan.has_onu %}ONU{% endif %}{% if vlan.has_onu and vlan.has_profile %} · {% endif %}{% if vlan.has_profile %}Perfil de provisionamento{% endif %}{% if not vlan.has_onu and not vlan.has_profile %}—{% endif %}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% if confirmation %}
+  <form method="post" class="communication-form">{% csrf_token %}
+    {% for field in form %}{{ field.as_hidden }}{% endfor %}
+    <input type="hidden" name="confirmation" value="{{ confirmation }}">
+    <button class="button primary" type="submit" name="action" value="remove">Remover {{ vlans|length }} VLAN{{ vlans|length|pluralize }}</button>
+  </form>
+  {% else %}
+  <p class="result-bar">A faixa contém VLANs em uso. Ajuste os limites para remover apenas VLANs sem vínculos.</p>
+  {% endif %}
+  {% else %}
+  <p class="result-bar">Nenhuma VLAN desse provedor na faixa informada.</p>
+  {% endif %}
+</section>
+{% endif %}
+{% endblock %}

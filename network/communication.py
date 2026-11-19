@@ -17,6 +17,6 @@ def check_olt_connection(olt, actor):
         detail = "Não foi possível concluir o teste. Confira a configuração da OLT e a conectividade do servidor."
     return OLTConnectionTest.objects.create(
         olt=olt, actor=actor, success=success, simulation=olt.mode == "simulation", stage=stage,
-        target="Simulação" if olt.mode == "simulation" else f"{olt.host}:{olt.ssh_port}",
+        target="Simulação" if olt.mode == "simulation" else f"{olt.host}:{olt.connection_port}",
         detail=detail, duration_ms=max(0, round((time.perf_counter() - started) * 1000)),
     )

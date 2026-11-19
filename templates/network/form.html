@@ -1,5 +1,5 @@
 {% extends 'base.html' %}
-{% block subtitle %}<p>Preencha os dados para manter sua rede organizada.</p>{% endblock %}
+{% block subtitle %}<p>{% if kind == 'vlan_range' %}A faixa inclui os dois extremos. De 1140 a 1156 são 17 VLANs para o mesmo provedor.{% else %}Preencha os dados para manter sua rede organizada.{% endif %}</p>{% endblock %}
 {% block actions %}{% if olt_for_test %}<a class="button secondary" href="{% url 'olt_communication' olt_for_test.pk %}">Testar comunicação</a>{% endif %}{% endblock %}
 {% block content %}
 <form method="post" class="panel edit-form" data-discovered-olt="{{ discovered.olt|default:'' }}">{% csrf_token %}
@@ -9,6 +9,7 @@
 {% if kind == 'olts' or kind == 'perfis' %}<div class="notice warning">VLAN, line profile, service profile e mapeamento GEM devem existir na OLT. O cadastro no ERP não cria esses recursos no equipamento.</div>{% endif %}
 <div class="form-grid">{% for field in form %}{% if field.is_hidden %}{{ field }}{% else %}<div class="field {% if field.errors %}invalid{% endif %}"><label for="{{ field.id_for_label }}">{{ field.label }}{% if field.field.required %}<span class="required">*</span>{% endif %}</label>{{ field }}{% if field.help_text %}<small>{{ field.help_text }}</small>{% endif %}{% for error in field.errors %}<span class="field-error">{{ error }}</span>{% endfor %}</div>{% endif %}{% endfor %}</div>
 {% if kind == 'onu' %}<div class="description-preview"><span>Descrição do equipamento</span><strong id="description-preview">Selecione o provedor e informe o cliente</strong><p id="profile-preview" class="hint"></p></div>{{ vlans_data|json_script:'vlans-data' }}{{ profiles_data|json_script:'profiles-data' }}{{ form.instance.profile_snapshot|json_script:'profile-snapshot' }}{% elif kind == 'perfis' %}{{ vlans_data|json_script:'vlans-data' }}{% endif %}
-<div class="form-footer"><a class="button secondary" href="{{ back_url }}">Cancelar</a><button class="button primary" type="submit">{% if kind == 'onu' %}Salvar e revisar provisionamento{% else %}Salvar cadastro{% endif %} →</button></div>
+<div class="form-footer"><a class="button secondary" href="{{ back_url }}">Cancelar</a><button class="button primary" type="submit">{% block submit_label %}{% if kind == 'onu' %}Salvar e revisar provisionamento{% elif kind == 'vlan_range' %}Salvar faixa{% else %}Salvar cadastro{% endif %} →{% endblock %}</button></div>
 </form>
+{% block after_form %}{% endblock %}
 {% endblock %}

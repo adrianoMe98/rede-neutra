@@ -15,6 +15,7 @@ ERP web para cadastro e provisionamento de ONTs/ONUs em uma rede neutra. Interfa
 - Perfis de provisionamento por provedor/OLT com VLAN de serviço, VLAN do cliente, line profile, service profile e GEM port. Os parâmetros são copiados para o cadastro da ONU e preservados após edições do perfil.
 - Consulta pontual de TX/RX **na ONU**, em dBm, com data da leitura. O estado “Provisionada” indica sucesso do cadastro na integração, e não monitoração online/offline.
 - Relatórios com filtros por descrição/serial, provedor, situação, VLAN, CTO e OLT, e exportação CSV compatível com Excel. Leituras simuladas são identificadas na tela e no CSV.
+- Inventário por provedor nas OLTs Huawei com exportação XLSX da descrição, serial GPON e endereços MAC disponíveis.
 - Simulação de todo o fluxo sem conexão com equipamentos; adaptadores separados por fabricante.
 
 ## Iniciar com Docker
@@ -74,8 +75,8 @@ Em cada tarefa na nuvem use o checkout existente: o ambiente já é isolado, nã
 
 | Modelo | Firmware esperado | Integração |
 | --- | --- | --- |
-| MA5800-X7 | MA5800V100R022C11 | Adaptador SSH experimental |
-| MA5683T | MA5600V800R017C10 | Adaptador SSH experimental |
+| MA5800-X7 | MA5800V100R022C11 | SSH ou Telnet experimental |
+| MA5683T | MA5600V800R017C10 | SSH ou Telnet experimental |
 | ZTE, FiberHome, outros | A definir | Simulação; adaptador físico ainda não implementado |
 
 O adaptador Huawei consulta `display ont autofind all`, gera `ont add` por SN/OMCI e `service-port` com tradução de VLAN e consulta `display ont optical-info`. O perfil permite definir a VLAN do cliente; em branco, usa a mesma VLAN de serviço. Cada perfil utiliza um GEM port. **VLAN, line profile, service profile e mapeamento GEM devem já existir na OLT.** Cadastrar VLAN ou perfil no ERP não os cria no equipamento. Configuração WAN, PPPoE, portas Ethernet, TR-069 e perfis de bridge/router não são configurados neste MVP.
@@ -92,21 +93,29 @@ Buscas exigem usuário operador e proteção CSRF. O histórico guarda OLT, usu�
 
 A tela informa a quantidade retornada pela OLT, a quantidade disponível para continuar e quantas ONTs exigem conferência. Uma ONU marcada como provisionada no ERP permanece visível se a OLT ainda a retorna no autofind, com aviso e acesso para conferir o cadastro; um novo envio automático é bloqueado. A lista só fica vazia quando a consulta interpretada da OLT realmente não contém ONTs. Erros de permissão da CLI geram falha explícita. A busca textual do inventário reconhece seriais Huawei nos formatos ASCII, ASCII com hífen e hexadecimal.
 
+### Consultar ONTs provisionadas por provedor
+
+Em **Relatórios → Inventário de ONTs por VLAN**, selecione o provedor e baixe o XLSX. O módulo usa as OLTs e VLANs de serviço vinculadas por um perfil de provisionamento ou por um cadastro de ONU. Em cada VLAN, consulta os service-ports, a tabela MAC e a configuração de cada posição PON/ONT.
+
+O XLSX identifica o serial GPON de `sn-auth`, o MAC de autenticação de `mac-auth`, quando configurado, e os MACs associados aos service-ports na tabela da OLT. Esses últimos podem pertencer a equipamentos conectados à ONT. A aba **Consultas** indica quais OLTs e VLANs retornaram dados, ficaram sem ONTs ou apresentaram erro. A busca usa SSH ou Telnet somente para consulta e está disponível aos operadores.
+
 ### Testar a comunicação com a OLT
 
 Em **OLTs**, clique em **Testar comunicação** na linha do equipamento; o mesmo acesso está na edição de uma OLT já salva. Confirme os dados salvos e execute o teste. Na tela de descoberta também é possível selecionar uma OLT e clicar em **Testar comunicação**, antes da busca.
 
-Em SSH, o teste valida a chave cadastrada em `known_hosts`, abre a conexão na porta configurada, autentica, recebe o prompt e executa `display version` para conferir o firmware. O resultado mostra a etapa que falhou (configuração, chave SSH, rede/porta, negociação SSH, autenticação, CLI ou firmware), tempo decorrido e data. O histórico armazena destino e responsável, sem senha ou transcrição bruta da sessão. Um teste bem-sucedido registra o estado naquele momento, sem monitoramento contínuo.
+O teste abre a conexão na porta configurada, autentica, recebe o prompt e executa `display version` para conferir o firmware. Em SSH, também valida a chave em `known_hosts`. O resultado mostra a etapa que falhou, o tempo decorrido e a data. O histórico armazena destino e responsável, sem senha ou transcrição bruta da sessão.
 
-Testes, autofind e leituras ópticas são consultas e funcionam com `ENABLE_LIVE_OLT=0`. O envio de provisionamento continua bloqueado até `ENABLE_LIVE_OLT=1`. A OLT deve estar no modo SSH com modelo/firmware suportados e credenciais válidas; no modo simulação, o resultado é demonstrativo e nenhuma conexão física é aberta. Chaves SSH desconhecidas ou alteradas são recusadas; para portas diferentes de 22, a entrada em `known_hosts` deve usar `[host]:porta`.
+Testes, autofind, inventário e leituras ópticas são consultas e funcionam com `ENABLE_LIVE_OLT=0`. O envio de provisionamento continua bloqueado até `ENABLE_LIVE_OLT=1`. A integração física exige modelo/firmware suportados e credenciais válidas. No modo simulação, o resultado é demonstrativo. Chaves SSH desconhecidas ou alteradas são recusadas. Para portas SSH diferentes de 22, a entrada em `known_hosts` deve usar `[host]:porta`.
+
+Para Telnet, selecione **Telnet • Huawei (experimental)** na edição da OLT, confira a porta Telnet (23 por padrão) e salve as credenciais da conta de gerenciamento. O serviço Telnet da OLT deve estar acessível pela rede de gerenciamento. Como o protocolo transmite credenciais sem criptografia, use uma rede de gerenciamento isolada ou uma VPN.
 
 Os perfis funcionam como modelos de parâmetros no ERP. Alterações futuras de nome ou IDs do perfil não modificam o conjunto já copiado para uma ONU cadastrada; para mudar os parâmetros de um cadastro ainda não provisionado, selecione outro perfil. Não é permitido trocar provedor, OLT ou VLAN de um perfil em uso. Desativar um perfil impede sua seleção em novos cadastros.
 
-O firmware é comparado com `display version` antes de enviar comandos. A compatibilidade efetiva da CLI depende do hardware, do patch de firmware, dos perfis e das permissões da conta; os testes automatizados usam respostas simuladas, não OLTs físicas. Não há alegação de homologação real. **Telnet não foi implementado**: os equipamentos informados podem usar SSH.
+O firmware é comparado com `display version` antes de enviar comandos. A compatibilidade da CLI depende do hardware, do patch de firmware, dos perfis e das permissões da conta. Os testes automatizados usam respostas simuladas.
 
 Para homologar SSH em laboratório:
 
-1. Cadastre uma OLT em simulação e confira a topologia e os IDs. Use outra OLT/cadastro para a conexão física; cadastros com ONUs provisionadas não podem trocar de identidade ou modo.
+1. Cadastre uma OLT em simulação e confira a topologia e os IDs. Use outro cadastro para a conexão física. Uma OLT com ONUs provisionadas pode alternar entre SSH e Telnet no mesmo endereço de gerenciamento.
 2. Garanta que a máquina/container alcança o endereço de gerenciamento. Libere apenas o destino necessário nas configurações de rede do ambiente. Uma VPN deve ser configurada pelo ambiente, sem cliente VPN dentro do container.
 3. Cadastre o modelo e o firmware exatos, usuário dedicado, senha, perfis existentes e GEM port. A senha é criptografada no banco com Fernet; não é exibida novamente. A rotação da chave exige recadastrar as senhas ou fazer migração própria.
 4. Instale em `data/known_hosts` (ou `OLT_KNOWN_HOSTS`) a chave SSH da OLT, conferindo a impressão digital por um canal confiável com o administrador. Em Docker o arquivo deve estar dentro do volume `/app/data`, legível pelo UID 10001. Chaves desconhecidas ou alteradas são recusadas. Não use aceitação automática nem habilite algoritmos legados sem avaliação específica.
